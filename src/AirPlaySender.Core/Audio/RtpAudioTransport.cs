@@ -65,15 +65,31 @@ public sealed class RtpAudioTransport : IAsyncDisposable
     public uint CurrentRtpTimestamp => (uint)(Latency + _framesSent);
 
     /// <summary>Starts the sync (1Hz), timing-responder, and retransmit-responder background loops, and sends the first (marker-bit) sync packet.</summary>
-    public void StartAncillaryLoops()
+    /// <summary>
+    /// Starts the control (retransmit) and timing (NTP) UDP responder loops
+    /// only — no clock anchor, no sync packet yet. Call this BEFORE
+    /// announcing "timingPort"/"timingProtocol: NTP" in the AirPlay-2
+    /// session SETUP request, not after: confirmed against a real HomePod
+    /// that if nothing is listening on the timing port yet when the
+    /// receiver tries to time-sync as part of accepting that SETUP, the
+    /// receiver just never replies — SETUP itself hangs, not merely
+    /// timing sync. <see cref="AnchorStreamClock"/> is the separate,
+    /// later call that actually starts the streaming timeline.
+    /// </summary>
+    public void StartResponders()
+    {
+        _cts ??= new CancellationTokenSource();
+        _controlLoop = Task.Run(() => ControlLoopAsync(_cts.Token));
+        _timingLoop = Task.Run(() => TimingLoopAsync(_cts.Token));
+    }
+
+    /// <summary>Anchors the RTP timeline to wall-clock NTP and sends the first (marker-bit) sync packet. Call once, right before <see cref="StartPacing"/>.</summary>
+    public void AnchorStreamClock()
     {
         _startTs = Ntp.ToRtpTimestamp(Ntp.Now(), SampleRate);
         _framesSent = 0;
         _firstAudio = true;
         _clock.Restart();
-        _cts = new CancellationTokenSource();
-        _controlLoop = Task.Run(() => ControlLoopAsync(_cts.Token));
-        _timingLoop = Task.Run(() => TimingLoopAsync(_cts.Token));
         SendSyncPacket(first: true);
     }
 
@@ -137,10 +153,17 @@ public sealed class RtpAudioTransport : IAsyncDisposable
         BinaryPrimitives.WriteUInt32BigEndian(header[4..], CurrentRtpTimestamp);
         BinaryPrimitives.WriteUInt32BigEndian(header[8..], _ssrc);
 
-        byte[] payload = _audioKey is not null
-            ? AlacUncompressedEncoder.EncodeFrame(interleavedSamples, FramesPerPacket)
-            : EncodeRawL16(interleavedSamples);
-
+        // Raw big-endian L16 PCM either way (RFC 3551 payload type 96) — encrypted
+        // when paired (AirPlay 2), plaintext when not (AirPlay 1). Verified against
+        // a real HomePod (gen 2): asking for ALAC (ct=2/audioFormat=0x40000 in the
+        // stream SETUP plist — the older akustikrausch/airplay2-sender-cpp recipe's
+        // "type 0x60 realtime is hardcoded ALAC" claim, itself sourced from
+        // shairport-sync) got the stream SETUP itself rejected outright (HTTP 400)
+        // on this device. Raw PCM with ct=1/audioFormat=0x800 (see
+        // BuildStreamSetupPlist) is what pyatv sends successfully to the same
+        // HomePod, byte-for-byte confirmed on the wire — so that's what this
+        // project matches now rather than the ALAC path.
+        byte[] payload = EncodeRawL16(interleavedSamples);
         byte[] wirePayload = _audioKey is not null ? EncryptPayload(header, payload) : payload;
 
         var pkt = new byte[12 + wirePayload.Length];

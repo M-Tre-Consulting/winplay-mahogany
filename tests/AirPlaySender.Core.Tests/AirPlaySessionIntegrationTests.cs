@@ -69,9 +69,12 @@ public class AirPlaySessionIntegrationTests
         byte[]? decrypted = ChaCha20Poly1305Cipher.TryDecrypt(receiver.AudioKey!, nonce, ciphertextAndTag, aad);
         Assert.NotNull(decrypted);
 
-        var expectedSamples = new short[RtpAudioTransport.FramesPerPacket * 2];
-        Array.Fill(expectedSamples, FakePcmFrameSource.SampleValue);
-        byte[] expectedAlac = AlacUncompressedEncoder.EncodeFrame(expectedSamples, RtpAudioTransport.FramesPerPacket);
-        Assert.Equal(expectedAlac, decrypted);
+        // Raw big-endian L16 PCM (RFC 3551 payload type 96), not ALAC — confirmed
+        // against a real HomePod as the encoding that actually gets accepted;
+        // see the comment on RtpAudioTransport.SendAudioPacket for the story.
+        var expectedPayload = new byte[RtpAudioTransport.FramesPerPacket * 2 * 2];
+        for (int i = 0; i < RtpAudioTransport.FramesPerPacket * 2; i++)
+            BinaryPrimitives.WriteInt16BigEndian(expectedPayload.AsSpan(i * 2), FakePcmFrameSource.SampleValue);
+        Assert.Equal(expectedPayload, decrypted);
     }
 }

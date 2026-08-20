@@ -14,29 +14,42 @@ per l'attribuzione completa.
 
 ## Stato attuale
 
-**Fase 1 — audio: implementata, testata a fondo, l'app compila e gira; non ancora provata contro hardware Apple reale.**
+**Fase 1 — audio: funziona, verificato contro un HomePod reale.** 🎉
 
-Tutta la parte protocollare (`src/AirPlaySender.Core`) è scritta, compila
-pulita e ha **31 test automatici**, incluso un test end-to-end che fa girare
-`AirPlaySession` contro un *finto ricevitore AirPlay 2* scritto da zero
-apposta per i test (`FakeAirPlay2Receiver`): un server TCP/UDP indipendente
-che implementa il lato server di SRP-6a e la sequenza RTSP/bplist, senza
-riusare il codice del client. Quel test fa completare all'app un pairing
-transient completo, cifrare un pacchetto audio RTP reale, e lo decifra sul
-lato server verificando che i byte corrispondano esattamente a quelli
-attesi — è la verifica più forte possibile senza un dispositivo Apple vero.
-Uno smoke-test manuale ha inoltre confermato che la cattura audio WASAPI e
-la discovery mDNS funzionano davvero su Windows.
+L'app si connette davvero a un HomePod (gen 2) in salotto, fa il pairing
+transient (SRP-6a, PIN fisso, nessuna interazione utente), negozia le
+chiavi AirPlay 2, e mette in stato "In riproduzione" — verificato sia da
+riga di comando (log passo-passo dell'handshake) sia dall'app WinUI 3 vera
+(screenshot: "Sala" → "In riproduzione", pulsante Disconnetti, barra volume
+attiva). Arrivarci ha richiesto una sessione di debug seria contro
+hardware reale — vedi i commit e i commenti in `AirPlaySession.cs` per i
+dettagli, in breve:
 
-L'app WinUI 3 (`src/AirPlaySender.App`) **compila senza errori e si avvia
-correttamente** — finestra nativa con titlebar personalizzata, tema
-scuro/chiaro automatico (Mica), lista dispositivi ed empty-state verificati
-visivamente con uno screenshot reale della finestra in esecuzione.
+- **Discovery mDNS**: due bug (interfaccia di rete sbagliata scelta in
+  presenza di una VPN con metrica più bassa della LAN; lookup dei servizi
+  sulla chiave sbagliata della libreria Zeroconf).
+- **URI RTSP malformato**: un indirizzo locale IPv4-mappato-su-IPv6
+  (`::ffff:192.168.1.88`) finiva senza parentesi quadre in un URI,
+  sintatticamente invalido.
+- **Schema del dizionario SETUP sbagliato**: il dizionario "sessione" deve
+  offrire `timingPort`/`timingProtocol: NTP` (non `isRemoteControlOnly`,
+  che è per un canale di *solo controllo remoto*, non audio — verificato
+  contro la documentazione di pyatv); lo stream deve chiedere PCM raw
+  (`ct=1`, `audioFormat=0x800`), non ALAC.
+- **Il bug vero**: il "risponditore" della porta di timing partiva solo
+  *dopo* l'intero handshake, ma il SETUP sessione dichiara quella porta
+  *prima* — se il ricevitore prova a sincronizzarsi e nessuno ascolta
+  ancora, resta in attesa e il SETUP non risponde mai. Bastava invertire
+  l'ordine.
 
-Quello che **manca ancora** prima di poter dire "funziona" senza riserve:
-una sessione di prova contro un HomePod o un Apple TV *reale* — un
-ricevitore Apple vero potrebbe avere comportamenti non documentati che
-nessun test locale può anticipare.
+Tutta la parte protocollare (`src/AirPlaySender.Core`) ha **31 test
+automatici**, incluso un test end-to-end che fa girare `AirPlaySession`
+contro un *finto ricevitore AirPlay 2* scritto da zero apposta per i test
+(`FakeAirPlay2Receiver`): un server TCP/UDP indipendente che implementa il
+lato server di SRP-6a e la sequenza RTSP/bplist, senza riusare il codice
+del client — utile per non regredire, ma è stato il test contro l'HomePod
+vero a scoprire i bug elencati sopra (nessun test locale può anticipare il
+comportamento di un ricevitore reale).
 
 **Fase 2 — screen mirroring: non implementata, R&D vera e propria.**
 
@@ -55,7 +68,7 @@ src/
     Discovery/             mDNS (_raop._tcp, _airplay._tcp) + parsing feature flags
     Pairing/               pair-setup (transient + PIN) e pair-verify
     Rtsp/                  connessione RTSP con framing cifrato AirPlay 2 + canale eventi
-    Audio/                 encoder ALAC "uncompressed", trasporto RTP, cattura WASAPI
+    Audio/                 trasporto RTP (PCM raw L16), cattura WASAPI, encoder ALAC "uncompressed" (non più usato di default — vedi sotto)
     AirPlaySession.cs      orchestratore: connect → pair → handshake → stream
 
   AirPlaySender.App/      app WinUI 3 (finestra, lista dispositivi, dialog PIN, volume)
@@ -108,16 +121,22 @@ verificati empiricamente in questo progetto:
    fra pairing *transient* (PIN fisso, HomePod/macOS — nessuna interazione
    utente) o pairing con **PIN a schermo** (Apple TV, la prima volta soltanto:
    le credenziali vengono salvate per le connessioni successive).
-3. **Handshake AirPlay 2**: `GET /info` → `SETUP` sessione → apertura canale
-   eventi → `RECORD` → `SETUP` stream (negozia ALAC realtime + la chiave
-   audio).
+3. **Handshake AirPlay 2**: `GET /info` → `SETUP` sessione (dichiara la
+   porta di timing NTP — va aperta *prima* di mandare questa richiesta,
+   non dopo) → apertura canale eventi → `RECORD` → `SETUP` stream (negozia
+   PCM raw + la chiave audio).
 4. **Streaming**: l'audio di sistema (WASAPI loopback) viene ricampionato a
-   44.1kHz/16-bit, impacchettato in frame ALAC "non compressi", cifrato
+   44.1kHz/16-bit, impacchettato come PCM raw big-endian, cifrato
    ChaCha20-Poly1305 e spedito via RTP, con sync a 1Hz e risposta alle
    richieste di ritrasmissione del ricevitore.
 
 ## Limitazioni note (Fase 1)
 
+- Provato contro un HomePod (gen 2, pairing transient); un Apple TV con PIN
+  a schermo, un altoparlante AirPlay 2 di terze parti, o un HomePod meno
+  recente potrebbero avere le loro sorprese — lo schema dei dizionari SETUP
+  che questo progetto usa è quello confermato funzionante su *quel*
+  dispositivo specifico, non garantito identico su tutti.
 - Un solo dispositivo collegato per volta (nessun multi-room/AirPlay group).
 - Nessuna rilevazione automatica di connessione persa a metà streaming (va
   disconnesso e riconnesso manualmente).
@@ -127,8 +146,9 @@ verificati empiricamente in questo progetto:
 
 ## Roadmap
 
-- **Fase 1.1**: prova end-to-end contro hardware reale, system tray icon,
-  rilevazione disconnessione, multi-room.
+- **Fase 1.1**: provare contro più dispositivi reali (Apple TV con PIN,
+  altri speaker AirPlay 2), system tray icon, rilevazione disconnessione,
+  multi-room.
 - **Fase 2 (screen mirroring)**: R&D aperta, **deliberatamente rimandata**
   (non affrontata insieme all'audio, per scelta). Nessun progetto open
   source implementa oggi un sender AirPlay Mirroring funzionante (esistono

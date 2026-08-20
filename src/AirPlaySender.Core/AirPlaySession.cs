@@ -44,6 +44,10 @@ public sealed class AirPlaySession : IAsyncDisposable
     /// <summary>Fired when the device needs its on-screen PIN typed in; call <see cref="SubmitPin"/> with the code.</summary>
     public event Action<string>? PinRequired;
     public event Action? Disconnected;
+    /// <summary>Fires one short line per handshake step (e.g. "SETUP session -> HTTP 200 (140 ms)"). Not localized; for diagnostics/log windows, not end-user UI copy.</summary>
+    public event Action<string>? Diagnostics;
+
+    private void Trace(string message) => Diagnostics?.Invoke(message);
 
     /// <param name="audioSourceFactory">Defaults to real WASAPI loopback capture; tests substitute a deterministic fake here.</param>
     public AirPlaySession(CredentialStore? credentialStore = null, PairingIdentity? identity = null, Func<IAudioCaptureSource>? audioSourceFactory = null)
@@ -82,12 +86,16 @@ public sealed class AirPlaySession : IAsyncDisposable
         uint activeRemote = (uint)rnd.Next();
 
         _rtsp = await RtspConnection.ConnectAsync(device.Host, device.Port, dacpId, activeRemote, ct).ConfigureAwait(false);
+        Trace($"TCP connesso a {device.Host}:{device.Port}, sessionId={_sessionId:X8} auth={(_airplay2 ? device.DetermineAuthMethod().ToString() : "nessuno (AirPlay 1)")}");
 
         State = AirPlaySessionState.Pairing;
         PairingResult? pairing = _airplay2 ? await RunPairingWithFallbackAsync(device, ct).ConfigureAwait(false) : null;
+        if (pairing is not null) Trace($"Pairing completato, sharedSecret={pairing.SharedSecret.Length} byte");
 
         State = AirPlaySessionState.Handshake;
         _audio = new RtpAudioTransport(device.Host, _sessionId, pairing?.AudioKey);
+        // Must be listening before the session SETUP announces our timingPort — see StartResponders' doc comment.
+        _audio.StartResponders();
 
         if (_airplay2)
             await RunAirPlay2HandshakeAsync(device, pairing!, ct).ConfigureAwait(false);
@@ -96,6 +104,7 @@ public sealed class AirPlaySession : IAsyncDisposable
 
         await StartStreamingAsync(ct).ConfigureAwait(false);
         State = AirPlaySessionState.Streaming;
+        Trace("Streaming avviato");
     }
 
     // ── pairing, with the receiver-driven fallbacks real devices need ────
@@ -170,72 +179,133 @@ public sealed class AirPlaySession : IAsyncDisposable
     private async Task RunAirPlay2HandshakeAsync(AirPlayDevice device, PairingResult pairing, CancellationToken ct)
     {
         _rtsp!.EnableEncryption(pairing.ControlWriteKey, pairing.ControlReadKey);
+        Trace("Canale di controllo cifrato armato");
 
-        await _rtsp.SendAp2RtspAsync("GET", "/info", ct: ct).ConfigureAwait(false); // capability plist — not needed for realtime audio
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        RtspResponse infoResp = await _rtsp.SendAp2RtspAsync("GET", "/info", ct: ct).ConfigureAwait(false); // capability plist — not needed for realtime audio
+        Trace($"GET /info -> HTTP {infoResp.StatusCode} ({sw.ElapsedMilliseconds} ms, {infoResp.Body.Length} byte)");
 
         string uri = _rtsp.BuildRtspUri(_sessionId);
+        Trace($"URI di sessione: {uri}");
 
+        sw.Restart();
         RtspResponse sessionResp = await _rtsp.SendAp2RtspAsync("SETUP", uri, "application/x-apple-binary-plist", BuildSessionSetupPlist(), ct: ct).ConfigureAwait(false);
-        if (!sessionResp.IsSuccess) throw new IOException($"AirPlay 2 session SETUP failed (HTTP {sessionResp.StatusCode})");
+        Trace($"SETUP sessione -> HTTP {sessionResp.StatusCode} ({sw.ElapsedMilliseconds} ms, {sessionResp.Body.Length} byte)");
+        if (!sessionResp.IsSuccess) throw new IOException($"AirPlay 2 session SETUP failed (HTTP {sessionResp.StatusCode}): {DescribeBody(sessionResp.Body)}");
         PlistValue? sessionReply = BinaryPlist.Decode(sessionResp.Body);
         int eventPort = (int)(sessionReply?.Find("eventPort")?.AsInt() ?? 0);
+        Trace($"eventPort={eventPort}");
 
         // A modern receiver requires the event channel OPEN before it accepts RECORD.
         if (eventPort != 0)
+        {
             _eventChannel = await AirPlayEventChannel.ConnectAsync(device.Host, eventPort, pairing.EventReadKey, pairing.EventWriteKey, ct).ConfigureAwait(false);
+            Trace("Canale eventi aperto");
+        }
 
         // RECORD between the two SETUPs (owntone/reference order). Some receivers reject this on the
         // encrypted realtime channel (they want PTP timing) — non-fatal, the FLUSH/sync timeline still drives playback.
-        await _rtsp.SendAp2RtspAsync("RECORD", uri, ct: ct).ConfigureAwait(false);
+        sw.Restart();
+        RtspResponse recordResp = await _rtsp.SendAp2RtspAsync("RECORD", uri, ct: ct).ConfigureAwait(false);
+        Trace($"RECORD -> HTTP {recordResp.StatusCode} ({sw.ElapsedMilliseconds} ms)");
 
+        sw.Restart();
         RtspResponse streamResp = await _rtsp.SendAp2RtspAsync("SETUP", uri, "application/x-apple-binary-plist", BuildStreamSetupPlist(pairing.AudioKey), isStreamSetup: true, ct: ct).ConfigureAwait(false);
-        if (!streamResp.IsSuccess) throw new IOException($"AirPlay 2 stream SETUP failed (HTTP {streamResp.StatusCode})");
+        Trace($"SETUP stream -> HTTP {streamResp.StatusCode} ({sw.ElapsedMilliseconds} ms, {streamResp.Body.Length} byte)");
+        if (!streamResp.IsSuccess) throw new IOException($"AirPlay 2 stream SETUP failed (HTTP {streamResp.StatusCode}): {DescribeBody(streamResp.Body)}");
         PlistValue? streamReply = BinaryPlist.Decode(streamResp.Body);
         PlistValue? stream0 = streamReply?.Find("streams")?.ArrayValue.FirstOrDefault();
         int dataPort = (int)(stream0?.Find("dataPort")?.AsInt() ?? 0);
         int controlPort = (int)(stream0?.Find("controlPort")?.AsInt() ?? 0);
         if (dataPort == 0) throw new IOException("AirPlay 2 stream SETUP returned no data port");
+        Trace($"dataPort={dataPort} controlPort={controlPort}");
 
         _audio!.SetRemotePorts(dataPort, controlPort == 0 ? dataPort : controlPort);
     }
 
+    /// <summary>Best-effort human-readable dump of an error response body — a plist if it decodes as one, else UTF-8 text, else hex — so a rejection is diagnosable without a debugger.</summary>
+    private static string DescribeBody(byte[] body)
+    {
+        if (body.Length == 0) return "(corpo vuoto)";
+        PlistValue? plist = BinaryPlist.Decode(body);
+        if (plist is not null) return DescribePlist(plist);
+        try
+        {
+            string text = System.Text.Encoding.UTF8.GetString(body);
+            if (text.All(c => !char.IsControl(c) || c is '\r' or '\n' or '\t')) return text;
+        }
+        catch { /* not valid UTF-8 — fall through to hex */ }
+        return "hex: " + Convert.ToHexString(body[..Math.Min(body.Length, 256)]);
+    }
+
+    private static string DescribePlist(PlistValue value) => value.Type switch
+    {
+        PlistValue.Kind.Dict => "{" + string.Join(", ", value.DictValue.Select(kv => $"{kv.Key}={DescribePlist(kv.Value)}")) + "}",
+        PlistValue.Kind.Array => "[" + string.Join(", ", value.ArrayValue.Select(DescribePlist)) + "]",
+        PlistValue.Kind.Str => $"\"{value.StrValue}\"",
+        PlistValue.Kind.Int => value.IntValue.ToString(),
+        PlistValue.Kind.Bool => value.BoolValue.ToString(),
+        PlistValue.Kind.Data => $"<{value.DataValue.Length} bytes>",
+        _ => value.Type.ToString(),
+    };
+
+    /// <summary>
+    /// "isRemoteControlOnly": true is for a REMOTE-CONTROL session
+    /// (control/command messages only — documented in pyatv's own
+    /// protocols.md under "AirPlay 2 / Remote Control"), not for audio.
+    /// This dict — no "isRemoteControlOnly", a real "timingPort", and
+    /// "timingProtocol": "NTP" — is pyatv's actual audio-streaming session
+    /// SETUP, confirmed byte-for-byte off the wire from a real pyatv run
+    /// against this project's test HomePod.
+    ///
+    /// Getting this exact dict accepted took a while to track down: the
+    /// receiver doesn't just record "timingPort" — the moment this SETUP
+    /// names an NTP timing port, it tries to time-sync against that port
+    /// as part of deciding how to answer, and if nothing is listening yet
+    /// it just never replies (SETUP itself hangs, no error). The actual
+    /// fix was ordering — <see cref="RtpAudioTransport.StartResponders"/>
+    /// must run, and be listening on that port, BEFORE this request goes
+    /// out. It is NOT any of: X-Apple-Client-Name (an extra header this
+    /// project used to send — removing it made no difference),
+    /// isMultiSelectAirPlay's value, or a firewall rule (all real things
+    /// tried and ruled out on real hardware first).
+    /// </summary>
     private byte[] BuildSessionSetupPlist()
     {
         string mac = LocalMacAddressOrPlaceholder();
         PlistValue root = new PlistDictBuilder()
             .Add("deviceID", mac)
-            .Add("sessionUUID", Guid.NewGuid().ToString("D").ToUpperInvariant())
-            .Add("timingPort", _audio!.LocalTimingPort)
-            .Add("timingProtocol", "NTP")
-            .Add("isMultiSelectAirPlay", true)
             .Add("groupContainsGroupLeader", false)
+            .Add("isMultiSelectAirPlay", true)
             .Add("macAddress", mac)
             // The model/OS strings below identify us to the receiver as an
             // Apple client. This isn't spoofing for deception — every
             // third-party AirPlay sender (pyatv included) does the same,
             // because some receivers gate AirPlay-2 features on a
-            // recognized Apple model string. X-Apple-Client-Name (a
-            // separate header, see RtspConnection) is where this app
-            // actually identifies itself.
+            // recognized Apple model string.
             .Add("model", "iPhone14,3")
             .Add("name", ClientName)
             .Add("osBuildVersion", "20F66")
             .Add("osName", "iPhone OS")
             .Add("osVersion", "16.5")
             .Add("senderSupportsRelay", false)
+            .Add("sessionUUID", Guid.NewGuid().ToString("D").ToUpperInvariant())
             .Add("sourceVersion", "690.7.1")
             .Add("statsCollectionEnabled", false)
+            .Add("timingPort", _audio!.LocalTimingPort)
+            .Add("timingProtocol", "NTP")
             .Build();
         return BinaryPlist.Encode(root);
     }
 
+    /// <summary>audioFormat/ct ask for raw Linear PCM, not ALAC — see the comment on <see cref="RtpAudioTransport.SendAudioPacket"/> for why (confirmed on the wire against a real HomePod).</summary>
     private byte[] BuildStreamSetupPlist(byte[] audioKey)
     {
         PlistValue stream = new PlistDictBuilder()
-            .Add("audioFormat", 0x40000L) // ALAC/44100/16/2
+            .Add("audioFormat", 0x800L) // Linear PCM/44100/16/2
             .Add("audioMode", "default")
             .Add("controlPort", _audio!.LocalControlPort)
-            .Add("ct", 2L) // ALAC
+            .Add("ct", 1L) // Raw PCM
             .Add("isMedia", true)
             .Add("latencyMax", 88200L)
             .Add("latencyMin", 11025L)
@@ -313,7 +383,7 @@ public sealed class AirPlaySession : IAsyncDisposable
         _source = _audioSourceFactory();
         _source.Start();
 
-        _audio!.StartAncillaryLoops();
+        _audio!.AnchorStreamClock();
         _audio.StartPacing(_source);
 
         _sessionCts = new CancellationTokenSource();

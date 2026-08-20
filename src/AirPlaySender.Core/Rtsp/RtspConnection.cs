@@ -49,8 +49,24 @@ public sealed class RtspConnection : IAsyncDisposable
         _stream = tcp.GetStream();
         DacpId = dacpId;
         ActiveRemote = activeRemote;
-        LocalAddress = ((IPEndPoint)tcp.Client.LocalEndPoint!).Address.ToString();
-        RemoteAddress = ((IPEndPoint)tcp.Client.RemoteEndPoint!).Address.ToString();
+        LocalAddress = FormatHost(((IPEndPoint)tcp.Client.LocalEndPoint!).Address);
+        RemoteAddress = FormatHost(((IPEndPoint)tcp.Client.RemoteEndPoint!).Address);
+    }
+
+    /// <summary>
+    /// A dual-stack socket connecting to an IPv4 peer reports its local/remote
+    /// endpoint as an IPv4-mapped IPv6 address ("::ffff:192.168.1.88"), which
+    /// <see cref="BuildRtspUri"/> would otherwise drop straight into a URI
+    /// unbracketed — syntactically invalid (the colons collide with the
+    /// URI's own host:port separator), and confirmed against a real HomePod
+    /// to make it either reject the request (HTTP 400) or never reply at
+    /// all. Map back to plain IPv4 first; bracket anything that's still
+    /// genuinely IPv6.
+    /// </summary>
+    private static string FormatHost(IPAddress address)
+    {
+        if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
+        return address.AddressFamily == AddressFamily.InterNetworkV6 ? $"[{address}]" : address.ToString();
     }
 
     public static async Task<RtspConnection> ConnectAsync(string host, int port, string dacpId, uint activeRemote, CancellationToken ct = default)
@@ -122,8 +138,14 @@ public sealed class RtspConnection : IAsyncDisposable
         sb.Append("DACP-ID: ").Append(DacpId).Append("\r\n");
         sb.Append("Active-Remote: ").Append(ActiveRemote).Append("\r\n");
         sb.Append("Client-Instance: ").Append(DacpId).Append("\r\n");
-        sb.Append("X-Apple-Client-Name: AirPlayForWindows\r\n");
-        if (isStreamSetup) sb.Append("X-Apple-StreamID: 1\r\n");
+        // Deliberately no X-Apple-Client-Name / X-Apple-StreamID here (an
+        // earlier version sent both, using `isStreamSetup` for the latter):
+        // confirmed against a real HomePod that a "full" audio-streaming
+        // session SETUP (isMultiSelectAirPlay + a real timingPort) gets
+        // silently dropped — no reply, ever — the moment either custom header
+        // is present, while the identical body without them gets a clean 200.
+        // pyatv, which streams to the same device successfully, sends neither.
+        _ = isStreamSetup; // kept as a parameter for call-site clarity even though it's currently unused
         AppendContentHeadersAndTerminator(sb, contentType, body);
         return ExchangeAsync(sb.ToString(), body, ct);
     }
