@@ -129,14 +129,15 @@ verificati empiricamente in questo progetto:
 
 - **Fase 1.1**: prova end-to-end contro hardware reale, system tray icon,
   rilevazione disconnessione, multi-room.
-- **Fase 2 (screen mirroring)**: R&D aperta. Nessun progetto open source
-  implementa oggi un sender AirPlay Mirroring funzionante (esistono solo
-  *receiver*, cioè il verso opposto). Servirebbe: cattura schermo
+- **Fase 2 (screen mirroring)**: R&D aperta, **deliberatamente rimandata**
+  (non affrontata insieme all'audio, per scelta). Nessun progetto open
+  source implementa oggi un sender AirPlay Mirroring funzionante (esistono
+  solo *receiver*, cioè il verso opposto). Servirebbe: cattura schermo
   (Desktop Duplication API), encoding H.264 hardware (Media Foundation),
   e — il vero ignoto — la crittografia del canale video, mai documentata
   pubblicamente con lo stesso livello di dettaglio dell'audio. Da trattare
   come progetto di ricerca a sé, con hardware Apple reale a disposizione per
-  il reverse engineering iterativo.
+  il reverse engineering iterativo, quando si deciderà di affrontarla.
 
 ## Licenza e attribuzioni
 

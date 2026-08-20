@@ -1,3 +1,6 @@
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using Zeroconf;
 
 namespace AirPlaySender.Core.Discovery;
@@ -10,6 +13,16 @@ namespace AirPlaySender.Core.Discovery;
 /// and the friendly device name/model on many receivers) together, since
 /// Zeroconf groups every service a single responder advertises under one
 /// host, and merges their TXT records for the same physical device.
+///
+/// Explicitly scopes which network interfaces the query goes out on
+/// (see <see cref="GetCandidateInterfaces"/>) instead of leaving that to
+/// Windows' own routing/interface-metric choice. A VPN/mesh adapter (e.g.
+/// Tailscale) commonly gets a LOWER interface metric than the real LAN
+/// adapter, which is exactly backwards for link-local mDNS multicast — it
+/// needs to go out on the interface that's actually on the LAN segment the
+/// receiver lives on, not whichever interface Windows currently prefers
+/// for general routing. Confirmed empirically: a raw mDNS query bound to
+/// the LAN adapter got real replies; letting the OS pick found nothing.
 /// </summary>
 public sealed class AirPlayDiscovery
 {
@@ -18,20 +31,32 @@ public sealed class AirPlayDiscovery
 
     public async Task<IReadOnlyList<AirPlayDevice>> DiscoverAsync(TimeSpan scanTime, CancellationToken cancellationToken = default)
     {
+        NetworkInterface[] candidateInterfaces = GetCandidateInterfaces();
         IReadOnlyList<IZeroconfHost> hosts = await ZeroconfResolver.ResolveAsync(
             [RaopServiceType, AirPlayServiceType],
             scanTime: scanTime,
-            cancellationToken: cancellationToken);
+            cancellationToken: cancellationToken,
+            netInterfacesToSendRequestOn: candidateInterfaces.Length > 0 ? candidateInterfaces : null);
 
         var devices = new List<AirPlayDevice>();
         foreach (IZeroconfHost host in hosts)
         {
+            // IZeroconfHost.Services is keyed by the per-host SERVICE INSTANCE
+            // name (e.g. "F2A6B5611EF6@Sala._raop._tcp.local."), not by the
+            // bare service-type string, so matching can't go through a
+            // dictionary lookup keyed on the constant we asked to browse for.
+            // Confusingly, on IService itself the bare service-type string
+            // (what you'd expect from "ServiceName") is actually exposed as
+            // `.Name`, while `.ServiceName` is the full per-instance name —
+            // verified directly against a live response, not assumed.
+            IService? raop = host.Services.Values.FirstOrDefault(s => s.Name == RaopServiceType);
             // No RAOP endpoint on this host = nothing we can stream audio to.
-            if (!host.Services.TryGetValue(RaopServiceType, out IService? raop)) continue;
+            if (raop is null) continue;
 
             var merged = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             MergeProperties(merged, raop.Properties);
-            if (host.Services.TryGetValue(AirPlayServiceType, out IService? airplay))
+            IService? airplay = host.Services.Values.FirstOrDefault(s => s.Name == AirPlayServiceType);
+            if (airplay is not null)
                 MergeProperties(merged, airplay.Properties);
 
             string ip = host.IPAddress ?? host.IPAddresses.FirstOrDefault() ?? "";
@@ -39,14 +64,40 @@ public sealed class AirPlayDiscovery
 
             devices.Add(new AirPlayDevice
             {
-                Name = CleanInstanceName(raop.Name) is { Length: > 0 } n ? n : host.DisplayName,
+                Name = CleanInstanceName(raop.ServiceName) is { Length: > 0 } n ? n : host.DisplayName,
                 Host = ip,
                 Port = raop.Port,
-                DeviceId = raop.Name,
+                DeviceId = raop.ServiceName,
                 Properties = merged,
             });
         }
         return devices;
+    }
+
+    /// <summary>
+    /// Interfaces worth sending an mDNS query on: up, not loopback, and
+    /// carrying at least one real (non link-local, non-APIPA) IPv4 unicast
+    /// address — i.e. actually configured on a LAN, not a VPN/tunnel
+    /// adapter sitting at a 169.254.x.x fallback address or a disconnected
+    /// Wi-Fi/Ethernet adapter Windows still lists as present.
+    /// </summary>
+    private static NetworkInterface[] GetCandidateInterfaces()
+    {
+        return NetworkInterface.GetAllNetworkInterfaces()
+            .Where(nic => nic.OperationalStatus == OperationalStatus.Up
+                       && nic.NetworkInterfaceType != NetworkInterfaceType.Loopback
+                       && HasRealIPv4Address(nic))
+            .ToArray();
+    }
+
+    private static bool HasRealIPv4Address(NetworkInterface nic) =>
+        nic.GetIPProperties().UnicastAddresses.Any(a =>
+            a.Address.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(a.Address) && !IsLinkLocal(a.Address));
+
+    private static bool IsLinkLocal(IPAddress address)
+    {
+        byte[] b = address.GetAddressBytes();
+        return b[0] == 169 && b[1] == 254; // 169.254.0.0/16 (APIPA / unconfigured)
     }
 
     private static void MergeProperties(Dictionary<string, string> into, IReadOnlyList<IReadOnlyDictionary<string, string>> propertySets)
