@@ -5,7 +5,7 @@
     <TargetFramework>net9.0-windows10.0.19041.0</TargetFramework>
     <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
     <RootNamespace>AirPlaySender.App</RootNamespace>
-    <ApplicationIcon />
+    <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <UseWinUI>true</UseWinUI>
     <Nullable>enable</Nullable>
@@ -37,6 +37,16 @@
 
   <ItemGroup>
     <ProjectReference Include="..\AirPlaySender.Core\AirPlaySender.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- ApplicationIcon above embeds this in the .exe (Explorer/file icon). It's
+         also copied next to the .exe so MainWindow can point AppWindow.SetIcon
+         at it directly — for an unpackaged app the taskbar/titlebar icon isn't
+         guaranteed to pick up the embedded resource on its own. -->
+    <Content Include="Assets\AppIcon.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
 
   <ItemGroup>

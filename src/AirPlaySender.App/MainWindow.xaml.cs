@@ -2,10 +2,13 @@ using System.Collections.ObjectModel;
 using AirPlaySender.Core;
 using AirPlaySender.Core.Discovery;
 using AirPlaySender.Core.Pairing;
+using Microsoft.UI;
+using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
+using WinRT.Interop;
 
 namespace AirPlaySender.App;
 
@@ -26,8 +29,26 @@ public sealed partial class MainWindow : Window
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(TitleBarArea);
         SystemBackdrop = new MicaBackdrop();
+        SetWindowIcon();
 
         _ = ScanAsync();
+    }
+
+    // App is unpackaged (WindowsPackageType=None), so unlike a packaged WinUI 3
+    // app the titlebar/taskbar icon isn't picked up automatically from the .exe's
+    // embedded resource (ApplicationIcon in the csproj) — it has to be set on the
+    // AppWindow explicitly, from the .ico copied next to the .exe at build time.
+    private void SetWindowIcon()
+    {
+        try
+        {
+            nint hwnd = WindowNative.GetWindowHandle(this);
+            WindowId windowId = Win32Interop.GetWindowIdFromWindow(hwnd);
+            AppWindow appWindow = AppWindow.GetFromWindowId(windowId);
+            string iconPath = Path.Combine(AppContext.BaseDirectory, "Assets", "AppIcon.ico");
+            if (File.Exists(iconPath)) appWindow.SetIcon(iconPath);
+        }
+        catch { /* cosmetic only — never worth failing startup over */ }
     }
 
     private async void OnRescanClicked(object sender, RoutedEventArgs e) => await ScanAsync();
