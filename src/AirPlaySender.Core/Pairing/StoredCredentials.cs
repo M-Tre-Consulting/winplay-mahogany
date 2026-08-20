@@ -10,10 +10,11 @@ namespace AirPlaySender.Core.Pairing;
 /// </summary>
 public sealed class StoredCredentials
 {
-    public required byte[] LtSeed { get; init; }      // our OWN long-term seed used for this pairing (PairingIdentity.Seed32)
-    public required byte[] PairingId { get; init; }    // our OWN pairing id (PairingIdentity.PairingId)
-    public required byte[] AccessoryId { get; init; }  // the receiver's HAP "Identifier"
-    public required byte[] AccessoryLtpk { get; init; } // the receiver's long-term Ed25519 public key
+    // Not `required` — see AirPlayDevice's doc comment (XamlCompiler.exe + `required`).
+    public byte[] LtSeed { get; init; } = [];      // our OWN long-term seed used for this pairing (PairingIdentity.Seed32)
+    public byte[] PairingId { get; init; } = [];    // our OWN pairing id (PairingIdentity.PairingId)
+    public byte[] AccessoryId { get; init; } = [];  // the receiver's HAP "Identifier"
+    public byte[] AccessoryLtpk { get; init; } = []; // the receiver's long-term Ed25519 public key
 }
 
 /// <summary>Hex-encoded JSON persistence for <see cref="StoredCredentials"/>, one file per install, keyed by AirPlayDevice.DeviceId.</summary>

@@ -15,15 +15,28 @@ public enum AirPlayAuthMethod
     HapPin,
 }
 
-/// <summary>A discovered AirPlay/RAOP receiver, with enough mDNS TXT data to decide how to authenticate to it.</summary>
+/// <summary>
+/// A discovered AirPlay/RAOP receiver, with enough mDNS TXT data to decide
+/// how to authenticate to it.
+///
+/// Deliberately NOT using C# <c>required</c> members here even though every
+/// real construction site sets all five: WinUI 3's XamlCompiler.exe (a
+/// .NET Framework 4.7.2 tool) generates a XAML type-metadata table that
+/// tries to default-construct every type reachable from bindable
+/// properties — including this one, transitively, via
+/// <c>DeviceItem.Device</c> — and chokes on <c>required</c> members there
+/// (silently, with no diagnostic, on some reachability shapes). Init-only
+/// properties with safe defaults keep the same "set everything via an
+/// object initializer" call-site shape without triggering that.
+/// </summary>
 public sealed class AirPlayDevice
 {
-    public required string Name { get; init; }
-    public required string Host { get; init; }
-    public required int Port { get; init; }
+    public string Name { get; init; } = "";
+    public string Host { get; init; } = "";
+    public int Port { get; init; }
     /// <summary>Stable per-device id (the RAOP instance name, normally "AA:BB:CC:DD:EE:FF@Name"), used as the credential-store key.</summary>
-    public required string DeviceId { get; init; }
-    public required IReadOnlyDictionary<string, string> Properties { get; init; }
+    public string DeviceId { get; init; } = "";
+    public IReadOnlyDictionary<string, string> Properties { get; init; } = new Dictionary<string, string>();
 
     public string Model => Properties.GetValueOrDefault("am", "");
     public bool RequiresPassword => AirPlayFeatureParser.IsPasswordRequired(Properties);

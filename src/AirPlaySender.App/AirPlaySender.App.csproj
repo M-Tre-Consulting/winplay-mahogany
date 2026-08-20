@@ -15,6 +15,17 @@
     <WindowsPackageType>None</WindowsPackageType>
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
     <EnableMsixTooling>false</EnableMsixTooling>
+    <!-- `dotnet build` uses the SDK's own MSBuild, whose $(MSBuildExtensionsPath)
+         never points at a Visual Studio install — so the WindowsAppSDK/MRT-Core
+         targets' default AppxMSBuildToolsPath (SDK-relative) never resolves,
+         even though the "Universal Windows Platform development" VS workload
+         is installed and genuinely has these tools. Point it at the real
+         location directly rather than disabling the targets that need it one
+         at a time (microsoft/WindowsAppSDK#4889 — a `dotnet build`-specific
+         gap). Machine-specific: adjust or delete this line if your Visual
+         Studio edition/path differs, or once building with `msbuild` directly
+         instead of `dotnet build` makes it unnecessary. -->
+    <AppxMSBuildToolsPath Condition="'$(AppxMSBuildToolsPath)' == '' AND Exists('C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Microsoft\VisualStudio\v17.0\AppxPackage\')">C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Microsoft\VisualStudio\v17.0\AppxPackage\</AppxMSBuildToolsPath>
     <Platforms>x64;arm64</Platforms>
     <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
   </PropertyGroup>

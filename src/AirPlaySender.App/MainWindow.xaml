@@ -7,13 +7,6 @@
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     mc:Ignorable="d">
 
-    <Window.Resources>
-        <local:BoolToVisibilityConverter x:Key="BoolToVisibility" />
-        <local:InverseBoolToVisibilityConverter x:Key="InverseBoolToVisibility" />
-        <local:InverseBoolConverter x:Key="InverseBoolConverter" />
-        <local:StringToVisibilityConverter x:Key="StringToVisibility" />
-    </Window.Resources>
-
     <Grid x:Name="RootGrid" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
         <Grid.RowDefinitions>
             <RowDefinition Height="48" />
@@ -76,17 +69,17 @@
                                         <TextBlock Text="{x:Bind Name}" FontWeight="SemiBold" FontSize="15" />
                                         <TextBlock Text="{x:Bind Subtitle}" Opacity="0.65" FontSize="12" />
                                         <TextBlock Text="{x:Bind StatusText, Mode=OneWay}" Opacity="0.8" FontSize="12" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"
-                                                   Visibility="{x:Bind StatusText, Mode=OneWay, Converter={StaticResource StringToVisibility}}" />
+                                                   Visibility="{x:Bind StatusTextVisibility, Mode=OneWay}" />
                                     </StackPanel>
 
                                     <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
                                         <ProgressRing IsActive="{x:Bind IsBusy, Mode=OneWay}" Width="18" Height="18"
-                                                      Visibility="{x:Bind IsBusy, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
+                                                      Visibility="{x:Bind BusyVisibility, Mode=OneWay}" />
                                         <Button Content="Disconnetti" Click="OnDisconnectClicked" Tag="{x:Bind}"
-                                                Visibility="{x:Bind IsConnected, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
+                                                Visibility="{x:Bind ConnectedVisibility, Mode=OneWay}" />
                                         <Button Content="Connetti" Click="OnConnectClicked" Tag="{x:Bind}" Style="{ThemeResource AccentButtonStyle}"
-                                                IsEnabled="{x:Bind IsBusy, Mode=OneWay, Converter={StaticResource InverseBoolConverter}}"
-                                                Visibility="{x:Bind IsConnected, Mode=OneWay, Converter={StaticResource InverseBoolToVisibility}}" />
+                                                IsEnabled="{x:Bind CanConnect, Mode=OneWay}"
+                                                Visibility="{x:Bind NotConnectedVisibility, Mode=OneWay}" />
                                     </StackPanel>
                                 </Grid>
                             </Border>

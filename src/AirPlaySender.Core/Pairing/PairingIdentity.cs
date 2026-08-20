@@ -11,8 +11,9 @@ namespace AirPlaySender.Core.Pairing;
 /// </summary>
 public sealed class PairingIdentity
 {
-    public required byte[] Seed32 { get; init; }
-    public required byte[] PairingId { get; init; }
+    // Not `required` — see AirPlayDevice's doc comment (XamlCompiler.exe + `required`).
+    public byte[] Seed32 { get; init; } = [];
+    public byte[] PairingId { get; init; } = [];
 
     private byte[]? _publicKey;
     public byte[] PublicKey32 => _publicKey ??= Ed25519Signer.PublicFromSeed(Seed32);

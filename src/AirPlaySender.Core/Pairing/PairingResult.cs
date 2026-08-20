@@ -10,18 +10,23 @@ namespace AirPlaySender.Core.Pairing;
 /// </summary>
 public sealed class PairingResult
 {
+    // Not `required` — see AirPlayDevice's doc comment: WinUI's XamlCompiler.exe
+    // chokes on `required` members in types reachable from the app's public
+    // surface. Every real construction site still sets all of these via an
+    // object initializer; the empty-array defaults are never actually used.
+
     /// <summary>Raw pairing shared secret: SRP session key K (64 bytes, transient) or the X25519 ECDH output (32 bytes, pair-verify). The AirPlay-2 audio key is the first 32 bytes of THIS, used directly with no further HKDF.</summary>
-    public required byte[] SharedSecret { get; init; }
+    public byte[] SharedSecret { get; init; } = [];
 
     /// <summary>Encrypts what we send on the RTSP control channel (HKDF "Control-Write-Encryption-Key").</summary>
-    public required byte[] ControlWriteKey { get; init; }
+    public byte[] ControlWriteKey { get; init; } = [];
     /// <summary>Decrypts what the receiver sends back on the RTSP control channel (HKDF "Control-Read-Encryption-Key").</summary>
-    public required byte[] ControlReadKey { get; init; }
+    public byte[] ControlReadKey { get; init; } = [];
 
     /// <summary>Decrypts what the receiver pushes on the event channel (HKDF "Events-Write-Encryption-Key" — named from the accessory's point of view).</summary>
-    public required byte[] EventReadKey { get; init; }
+    public byte[] EventReadKey { get; init; } = [];
     /// <summary>Encrypts our replies on the event channel (HKDF "Events-Read-Encryption-Key" — named from the accessory's point of view).</summary>
-    public required byte[] EventWriteKey { get; init; }
+    public byte[] EventWriteKey { get; init; } = [];
 
     /// <summary>The AirPlay-2 realtime audio key: SharedSecret truncated to 32 bytes, used directly with ChaCha20-Poly1305 (no HKDF — see AirPlaySession/AudioEncryptor for why).</summary>
     public byte[] AudioKey => SharedSecret.Length > 32 ? SharedSecret[..32] : SharedSecret;

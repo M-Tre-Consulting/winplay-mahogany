@@ -14,7 +14,7 @@ per l'attribuzione completa.
 
 ## Stato attuale
 
-**Fase 1 — audio: implementata, testata a fondo, non ancora provata contro hardware Apple reale.**
+**Fase 1 — audio: implementata, testata a fondo, l'app compila e gira; non ancora provata contro hardware Apple reale.**
 
 Tutta la parte protocollare (`src/AirPlaySender.Core`) è scritta, compila
 pulita e ha **31 test automatici**, incluso un test end-to-end che fa girare
@@ -27,6 +27,11 @@ lato server verificando che i byte corrispondano esattamente a quelli
 attesi — è la verifica più forte possibile senza un dispositivo Apple vero.
 Uno smoke-test manuale ha inoltre confermato che la cattura audio WASAPI e
 la discovery mDNS funzionano davvero su Windows.
+
+L'app WinUI 3 (`src/AirPlaySender.App`) **compila senza errori e si avvia
+correttamente** — finestra nativa con titlebar personalizzata, tema
+scuro/chiaro automatico (Mica), lista dispositivi ed empty-state verificati
+visivamente con uno screenshot reale della finestra in esecuzione.
 
 Quello che **manca ancora** prima di poter dire "funziona" senza riserve:
 una sessione di prova contro un HomePod o un Apple TV *reale* — un
@@ -65,10 +70,15 @@ tests/
 ## Come si compila
 
 Serve **Visual Studio 2022** con il workload **"Sviluppo Windows universale"**
-installato (necessario per i task MSBuild di packaging AppX/PRI usati anche
-dalle app WinUI 3 *non* pacchettizzate — è una lacuna nota del solo SDK
-`dotnet` da riga di comando, si veda
-[microsoft/WindowsAppSDK#4889](https://github.com/microsoft/WindowsAppSDK/issues/4889)).
+installato — non per usare l'IDE, ma perché quel workload è l'unico modo di
+avere sul disco i task MSBuild di packaging AppX/PRI che *anche* le app
+WinUI 3 non pacchettizzate richiedono in fase di build. Con solo l'SDK
+`dotnet` da riga di comando quei task non esistono da nessuna parte
+([microsoft/WindowsAppSDK#4889](https://github.com/microsoft/WindowsAppSDK/issues/4889));
+`AirPlaySender.App.csproj` punta `AppxMSBuildToolsPath` alla cartella reale
+del workload installato apposta per far funzionare `dotnet build` senza
+dover invocare `msbuild.exe` a mano — se il percorso della tua installazione
+VS è diverso, aggiusta quella proprietà nel csproj.
 
 ```powershell
 dotnet test tests/AirPlaySender.Core.Tests/AirPlaySender.Core.Tests.csproj
@@ -78,6 +88,17 @@ dotnet build src/AirPlaySender.App/AirPlaySender.App.csproj -r win-x64
 Al primo avvio Windows chiederà il permesso firewall per il traffico di rete
 locale (mDNS discovery + streaming audio via UDP) — va consentito almeno per
 la rete privata.
+
+**Nota per chi tocca `AirPlaySender.App`**: XamlCompiler.exe (lo strumento
+.NET Framework 4.7.2 di WindowsAppSDK 1.6 che compila XAML/x:Bind) va in
+crash silenzioso, senza nessun messaggio d'errore, su due pattern specifici
+verificati empiricamente in questo progetto:
+1. proprietà C# `required` su un tipo raggiungibile dalla superficie
+   pubblica bindabile (vedi il commento su `AirPlayDevice`);
+2. istanziare un tipo `local:` (dello stesso progetto, non ancora compilato)
+   come elemento risorsa XAML, es. in `Window.Resources` — anche una classe
+   vuota, converter o no. Per questo `DeviceItem` espone proprietà
+   `Visibility`/`bool` già calcolate invece di usare `IValueConverter`.
 
 ## Come funziona (in breve)
 
