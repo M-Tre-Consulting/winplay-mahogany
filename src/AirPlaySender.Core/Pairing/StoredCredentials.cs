@@ -1,0 +1,92 @@
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
+namespace AirPlaySender.Core.Pairing;
+
+/// <summary>
+/// The result of a completed on-screen-PIN HAP pair-setup: the accessory's
+/// long-term identity, kept so later connects run pair-verify only and
+/// never ask for the PIN again.
+/// </summary>
+public sealed class StoredCredentials
+{
+    public required byte[] LtSeed { get; init; }      // our OWN long-term seed used for this pairing (PairingIdentity.Seed32)
+    public required byte[] PairingId { get; init; }    // our OWN pairing id (PairingIdentity.PairingId)
+    public required byte[] AccessoryId { get; init; }  // the receiver's HAP "Identifier"
+    public required byte[] AccessoryLtpk { get; init; } // the receiver's long-term Ed25519 public key
+}
+
+/// <summary>Hex-encoded JSON persistence for <see cref="StoredCredentials"/>, one file per install, keyed by AirPlayDevice.DeviceId.</summary>
+public sealed class CredentialStore
+{
+    private sealed class Entry
+    {
+        public string LtSeed { get; set; } = "";
+        public string PairingId { get; set; } = "";
+        public string AccessoryId { get; set; } = "";
+        public string AccessoryLtpk { get; set; } = "";
+    }
+
+    private readonly string _path;
+    private Dictionary<string, Entry> _entries = new();
+
+    public CredentialStore(string? path = null)
+    {
+        _path = path ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "AirPlayForWindows", "credentials.json");
+        Load();
+    }
+
+    private void Load()
+    {
+        try
+        {
+            if (File.Exists(_path))
+                _entries = JsonSerializer.Deserialize<Dictionary<string, Entry>>(File.ReadAllText(_path))
+                           ?? new Dictionary<string, Entry>();
+        }
+        catch
+        {
+            _entries = new Dictionary<string, Entry>(); // a corrupt store just means "pair again", not a crash
+        }
+    }
+
+    private void Save()
+    {
+        string? dir = Path.GetDirectoryName(_path);
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+        File.WriteAllText(_path, JsonSerializer.Serialize(_entries, s_jsonOptions));
+    }
+
+    private static readonly JsonSerializerOptions s_jsonOptions = new() { WriteIndented = true };
+
+    public StoredCredentials? Get(string deviceId)
+    {
+        if (!_entries.TryGetValue(deviceId, out Entry? e)) return null;
+        return new StoredCredentials
+        {
+            LtSeed = Convert.FromHexString(e.LtSeed),
+            PairingId = Convert.FromHexString(e.PairingId),
+            AccessoryId = Convert.FromHexString(e.AccessoryId),
+            AccessoryLtpk = Convert.FromHexString(e.AccessoryLtpk),
+        };
+    }
+
+    public void Set(string deviceId, StoredCredentials credentials)
+    {
+        _entries[deviceId] = new Entry
+        {
+            LtSeed = Convert.ToHexString(credentials.LtSeed),
+            PairingId = Convert.ToHexString(credentials.PairingId),
+            AccessoryId = Convert.ToHexString(credentials.AccessoryId),
+            AccessoryLtpk = Convert.ToHexString(credentials.AccessoryLtpk),
+        };
+        Save();
+    }
+
+    public void Remove(string deviceId)
+    {
+        if (_entries.Remove(deviceId)) Save();
+    }
+}

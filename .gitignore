@@ -1,0 +1,26 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+
+## Visual Studio
+.vs/
+
+## Test results
+TestResults/
+
+## Rider / VS Code
+.idea/
+.vscode/
+
+## Windows App SDK / MSIX
+AppPackages/
+BundleArtifacts/
+*.appx
+*.appxbundle
+*.appxupload
+
+## Credentials this app stores locally (Ed25519 identity + paired-device
+## long-term keys) — never belongs in source control.
+credentials.json
