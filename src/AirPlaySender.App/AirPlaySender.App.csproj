@@ -28,6 +28,13 @@
     <AppxMSBuildToolsPath Condition="'$(AppxMSBuildToolsPath)' == '' AND Exists('C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Microsoft\VisualStudio\v17.0\AppxPackage\')">C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Microsoft\VisualStudio\v17.0\AppxPackage\</AppxMSBuildToolsPath>
     <Platforms>x64;arm64</Platforms>
     <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
+
+    <!-- The app's own UI text is hardcoded Italian (no .resx localization),
+         so the only thing satellite resources carry is other cultures'
+         strings for WinAppSDK/WPF-interop internals we never show. Publish
+         only en/it to keep the self-contained (installer) output from
+         ballooning with ~40 unused language folders. -->
+    <SatelliteResourceLanguages>it;en</SatelliteResourceLanguages>
   </PropertyGroup>
 
   <ItemGroup>

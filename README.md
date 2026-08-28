@@ -102,6 +102,44 @@ Al primo avvio Windows chiederà il permesso firewall per il traffico di rete
 locale (mDNS discovery + streaming audio via UDP) — va consentito almeno per
 la rete privata.
 
+## Come si distribuisce
+
+Per dare l'app a qualcuno senza consegnargli l'intera cartella di build,
+`installer/` produce un singolo `Setup.exe` (Inno Setup) che installa
+per-utente (nessun prompt UAC), crea la voce nel menu Start e un
+disinstallatore vero:
+
+```powershell
+powershell -File installer\build-installer.ps1
+```
+
+Output: `installer\output\AirPlayWindows-Setup-<versione>.exe`. Lo script fa
+due cose, entrambe scriptate apposta per restare un comando solo:
+
+1. `dotnet publish` in configurazione Release, self-contained (nessun .NET
+   da installare sulla macchina di chi lo riceve).
+2. Compila `installer/AirPlayWindows.iss` con `ISCC.exe`.
+
+**Nota per chi tocca lo script**: `dotnet publish` di un'app WinUI 3 non
+pacchettizzata *non* copia l'output XAML compilato dell'app
+(`AirPlaySender.App.pri` e ogni `*.xbf`) nella cartella di publish, anche se
+`dotnet build` lo produce correttamente nella cartella accanto — un gap noto
+dello strumento, non un errore di questo script. Senza quei file l'app parte
+e va in crash nativo all'istante (`Microsoft.UI.Xaml.dll`,
+`STATUS_STOWED_EXCEPTION`) perché il runtime XAML non trova la finestra
+compilata; `build-installer.ps1` li ricopia a mano da
+`bin\Release\...\win-x64\` subito dopo il publish — se mai si sposta o si
+rinomina quella cartella, aggiusta lì.
+
+Deliberatamente **non** è un pacchetto MSIX: passare
+`WindowsPackageType=MSIX` nel csproj riaprirebbe gli stessi problemi di
+XamlCompiler.exe/`AppxMSBuildToolsPath` descritti sopra, e richiederebbe un
+certificato di firma perché chi lo riceve possa installarlo senza sbattersi
+a fidarsi manualmente di un certificato self-signed. Un `Setup.exe` non
+firmato fa comunque scattare SmartScreen al primo avvio ("Informazioni
+aggiuntive → Esegui comunque") — inevitabile senza un certificato di
+code-signing, indipendentemente dal formato scelto.
+
 **Nota per chi tocca `AirPlaySender.App`**: XamlCompiler.exe (lo strumento
 .NET Framework 4.7.2 di WindowsAppSDK 1.6 che compila XAML/x:Bind) va in
 crash silenzioso, senza nessun messaggio d'errore, su due pattern specifici

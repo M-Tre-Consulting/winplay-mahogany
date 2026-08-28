@@ -21,6 +21,9 @@ BundleArtifacts/
 *.appxbundle
 *.appxupload
 
+## Installer build output (produced by installer/build-installer.ps1)
+installer/output/
+
 ## Credentials this app stores locally (Ed25519 identity + paired-device
 ## long-term keys) — never belongs in source control.
 credentials.json
