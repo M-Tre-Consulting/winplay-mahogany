@@ -131,6 +131,14 @@ compilata; `build-installer.ps1` li ricopia a mano da
 `bin\Release\...\win-x64\` subito dopo il publish — se mai si sposta o si
 rinomina quella cartella, aggiusta lì.
 
+Lo script toglie anche ~64 MB di DLL WPF/WinForms che il publish
+self-contained include sempre per questo target, anche se l'app è WinUI 3
+pura e non le tocca mai (verificato: l'app parte e funziona identica senza,
+comprese Presentation*.dll, System.Windows.Forms*.dll). Non sono le lingue
+a pesare — le risorse per-cultura di tutte le lingue insieme sono ~3.6 MB,
+ininfluenti; l'app comunque non ha un sistema di localizzazione, il testo
+è tutto italiano fisso.
+
 Deliberatamente **non** è un pacchetto MSIX: passare
 `WindowsPackageType=MSIX` nel csproj riaprirebbe gli stessi problemi di
 XamlCompiler.exe/`AppxMSBuildToolsPath` descritti sopra, e richiederebbe un

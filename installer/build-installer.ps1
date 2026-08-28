@@ -46,6 +46,42 @@ foreach ($f in $xamlOutputFiles) {
     Write-Host "   copied $($f.Name)"
 }
 
+# Self-contained publish for this TFM (net9.0-windows + UseWinUI) drags in
+# the ENTIRE Windows Desktop shared runtime - WPF and WinForms included -
+# even though the app is WinUI 3 only and never references either one.
+# That's ~64 MB of dead weight (measured), dwarfing the actual per-language
+# resource files (~3.6 MB total for every culture combined - languages were
+# never the problem). Safe to delete post-publish: nothing in this app's
+# call graph touches WPF/WinForms types, so the CLR never tries to load
+# these DLLs. Left alone on purpose: UIAutomationClient/Provider/Types
+# (WinUI's own accessibility/Narrator support genuinely uses these) and
+# DirectWriteForwarder.dll (text rendering, shared with WinUI's own path).
+$deadWeightDlls = @(
+    "PresentationCore.dll", "PresentationFramework.dll", "PresentationFramework.Aero.dll",
+    "PresentationFramework.Aero2.dll", "PresentationFramework.AeroLite.dll", "PresentationFramework.Classic.dll",
+    "PresentationFramework.Fluent.dll", "PresentationFramework.Luna.dll", "PresentationFramework.Royale.dll",
+    "PresentationFramework-SystemCore.dll", "PresentationFramework-SystemData.dll",
+    "PresentationFramework-SystemDrawing.dll", "PresentationFramework-SystemXml.dll",
+    "PresentationFramework-SystemXmlLinq.dll", "PresentationNative_cor3.dll", "PresentationUI.dll",
+    "ReachFramework.dll", "System.Printing.dll", "System.Windows.Controls.Ribbon.dll",
+    "System.Windows.Extensions.dll", "System.Windows.Forms.dll", "System.Windows.Forms.Design.dll",
+    "System.Windows.Forms.Design.Editors.dll", "System.Windows.Forms.Primitives.dll",
+    "System.Windows.Input.Manipulations.dll", "System.Windows.Presentation.dll", "System.Windows.dll",
+    "System.Xaml.dll", "WindowsFormsIntegration.dll", "Microsoft.VisualBasic.dll",
+    "Microsoft.VisualBasic.Core.dll", "Microsoft.VisualBasic.Forms.dll", "PenImc_cor3.dll",
+    "wpfgfx_cor3.dll", "System.Design.dll", "System.Drawing.Design.dll"
+)
+Write-Host "==> Stripping unused WPF/WinForms assemblies from the self-contained publish" -ForegroundColor Cyan
+$removedBytes = 0
+foreach ($name in $deadWeightDlls) {
+    $path = Join-Path $publishDir $name
+    if (Test-Path $path) {
+        $removedBytes += (Get-Item $path).Length
+        Remove-Item $path -Force
+    }
+}
+Write-Host ("   removed {0:N1} MB" -f ($removedBytes / 1MB))
+
 if (-not (Test-Path $InnoCompiler)) {
     throw "Inno Setup compiler not found at '$InnoCompiler'. Install it (winget install JRSoftware.InnoSetup) or pass -InnoCompiler <path>."
 }
