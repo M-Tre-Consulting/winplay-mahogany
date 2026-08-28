@@ -1,16 +1,21 @@
-# AirPlay per Windows
+# WinPlay Mahogany
 
-Un sender AirPlay 2 nativo per Windows: cattura l'audio di sistema e lo
-trasmette a qualunque speaker/TV AirPlay 2 (HomePod, Apple TV, altoparlanti
-AirPlay 2 di terze parti), con pairing e crittografia reali — non un
-"receiver" che riceve da iPhone, ma il contrario: Windows che *manda* audio
-alla rete Apple.
+AirPlay nativo per Windows, nei due versi:
 
-Apple non pubblica API per un sender AirPlay su piattaforme non Apple.
-Questo progetto ricostruisce il protocollo (pairing HAP, RTSP cifrato,
-streaming RTP) seguendo la documentazione tecnica di due progetti open
-source indipendenti, validati su hardware reale — vedi [NOTICE.md](NOTICE.md)
-per l'attribuzione completa.
+- **Sender audio** (Fase 1, funzionante): cattura l'audio di sistema e lo
+  trasmette a qualunque speaker/TV AirPlay 2 (HomePod, Apple TV, altoparlanti
+  AirPlay 2 di terze parti), con pairing e crittografia reali.
+- **Ricevitore di mirroring** (Fase 2, in corso — vedi sotto): fa comparire
+  questo PC come bersaglio "Duplica schermo" nel Centro di Controllo di un
+  iPhone. Pairing e cifratura funzionano fino in fondo; il video vero e
+  proprio no, non ancora, per un motivo specifico e documentato più sotto.
+
+Apple non pubblica API per nessuno dei due versi su piattaforme non Apple.
+Questo progetto ricostruisce i protocolli (pairing HAP, RTSP cifrato,
+streaming RTP, e per il mirroring il cifrario FairPlay vero) seguendo la
+documentazione tecnica di alcuni progetti open source indipendenti, validati
+dove possibile su hardware reale — vedi [NOTICE.md](NOTICE.md) per
+l'attribuzione completa.
 
 ## Stato attuale
 
@@ -51,11 +56,57 @@ del client — utile per non regredire, ma è stato il test contro l'HomePod
 vero a scoprire i bug elencati sopra (nessun test locale può anticipare il
 comportamento di un ricevitore reale).
 
-**Fase 2 — screen mirroring: non implementata, R&D vera e propria.**
+**Fase 2 — ricevitore di mirroring: pairing e cifratura funzionano fino in
+fondo su hardware reale; il video no, non ancora.** 🧩
 
-A differenza dell'audio, il mirroring dello schermo AirPlay non ha *nessun*
-riferimento open source funzionante per il verso "Windows come sender". Vedi
-la sezione [Roadmap](#roadmap) più sotto.
+A differenza della Fase 1 (dove esistevano due riferimenti open source
+validati), qui il riferimento principale è [UxPlay](https://github.com/FDH2/UxPlay)
+(GPLv3) — un ricevitore di mirroring reale e funzionante, ma scritto per
+hardware/iOS più vecchi di quello disponibile qui. Ogni pezzo qui sotto è
+stato verificato *davvero* contro un iPhone reale (iOS 26.6.1, iPhone 13 Pro
+Max), non solo compilato:
+
+- ✅ **Annuncio mDNS** (`_airplay._tcp`) — l'iPhone vede questo PC nel Centro
+  di Controllo.
+- ✅ **Server RTSP** che accetta la connessione reale dell'iPhone e dialoga
+  `OPTIONS`/`GET /info`/`SETUP`/`RECORD`/`GET_PARAMETER`/`TEARDOWN`.
+- ✅ **Pairing come accessorio** (`PairingAccessorySession`) — *non* lo
+  schema HAP TLV8/SRP della Fase 1: uno schema legacy più semplice, byte
+  grezzi invece di TLV8, AES-128-CTR invece di ChaCha20-Poly1305 per
+  cifrare solo le firme Ed25519/X25519 dell'handshake. L'iPhone lo accetta
+  e lo ricorda tra un tentativo e l'altro (salta dritto a pair-verify dal
+  secondo tentativo in poi — esattamente il comportamento di un dispositivo
+  già associato).
+- ✅ **Handshake FairPlay** (`/fp-setup`, entrambi i round) — byte
+  precatturati da UxPlay, riprodotti identici (non calcolati: nessuno,
+  UxPlay incluso, ha mai capito l'algoritmo reale di questo passaggio, solo
+  osservato che Apple accetta queste risposte fisse).
+- ✅ **Il cifrario FairPlay vero** (`FairPlayCipher.cs` +
+  `FairPlayCipherTables.g.cs`) — quello disassemblato ("OmgHax" nel codice
+  di UxPlay), ~1200 righe e ~480KB di S-box opache. Porta a decifrare una
+  chiave di sessione reale, inviata da un iPhone vero, senza errori.
+  Portato con due discipline per non introdurre errori di trascrizione
+  invece che a mano: le tabelle sono state estratte *meccanicamente* da
+  script Python e verificate byte-per-byte con hash SHA-256 incrociati
+  (C originale ↔ Python ↔ C#); la logica è stata copiata
+  carattere-per-carattere dal C, con solo i cast che C# richiede e che C
+  faceva implicitamente.
+- ⏳ **Il blocco attuale**: dopo `SETUP`/`RECORD`, l'iPhone fa `TEARDOWN`
+  senza mai aprire la connessione dati video vera. Ho provato diverse
+  ipotesi verificabili (una `timingPort` reale invece di 0, offrire
+  proattivamente la porta dati, un canale eventi reale e cifrato con la
+  stessa convenzione HKDF "Events-Salt" della Fase 1) — nessuna ha cambiato
+  il comportamento. L'indizio più concreto: il campo `et` (tipo di
+  cifratura) nella richiesta `SETUP` vale **32**, un valore che non compare
+  in nessun riferimento disponibile (UxPlay conosce solo 0/3/5). Con
+  `osVersion: 26.6.1`, `sourceVersion: 960.13.1`, è plausibile che questo
+  iOS usi per il mirroring uno schema di cifratura più recente di quello
+  che qualunque progetto open source documenta oggi — a differenza di tutto
+  il resto sopra, qui non c'è modo di verificare un'ipotesi senza una
+  cattura di traffico di una sessione riuscita per confronto.
+
+Tutto il codice di questa fase vive in `src/AirPlaySender.Core/Receiving/` —
+architettura completa e riutilizzabile, non un tentativo buttato via.
 
 ## Architettura
 
@@ -69,7 +120,16 @@ src/
     Pairing/               pair-setup (transient + PIN) e pair-verify
     Rtsp/                  connessione RTSP con framing cifrato AirPlay 2 + canale eventi
     Audio/                 trasporto RTP (PCM raw L16), cattura WASAPI, encoder ALAC "uncompressed" (non più usato di default — vedi sotto)
-    AirPlaySession.cs      orchestratore: connect → pair → handshake → stream
+    Net/                   helper condivisi: filtro interfacce di rete per mDNS, MAC address locale
+    Receiving/             Fase 2 — Windows come RICEVITORE di mirroring (vedi sopra)
+      AirPlayMirroringAdvertiser.cs   annuncio mDNS _airplay._tcp
+      AirPlayReceiverServer.cs        server RTSP: OPTIONS/GET info/SETUP/RECORD/...
+      PairingAccessorySession.cs      pairing come accessorio (schema legacy, non HAP TLV8)
+      FairPlaySetup.cs                handshake /fp-setup (replay di byte catturati da UxPlay)
+      FairPlayCipher.cs               il cifrario FairPlay vero, portato da UxPlay/OmgHax
+      FairPlayCipherTables.g.cs       le sue tabelle S-box, estratte meccanicamente (non a mano)
+      MirroringDataReceiver.cs        canale dati video (TCP), framing pacchetti + decrypt
+    AirPlaySession.cs      orchestratore Fase 1: connect → pair → handshake → stream
 
   AirPlaySender.App/      app WinUI 3 (finestra, lista dispositivi, dialog PIN, volume)
 
@@ -195,15 +255,22 @@ verificati empiricamente in questo progetto:
 - **Fase 1.1**: provare contro più dispositivi reali (Apple TV con PIN,
   altri speaker AirPlay 2), system tray icon, rilevazione disconnessione,
   multi-room.
-- **Fase 2 (screen mirroring)**: R&D aperta, **deliberatamente rimandata**
-  (non affrontata insieme all'audio, per scelta). Nessun progetto open
-  source implementa oggi un sender AirPlay Mirroring funzionante (esistono
-  solo *receiver*, cioè il verso opposto). Servirebbe: cattura schermo
-  (Desktop Duplication API), encoding H.264 hardware (Media Foundation),
-  e — il vero ignoto — la crittografia del canale video, mai documentata
-  pubblicamente con lo stesso livello di dettaglio dell'audio. Da trattare
-  come progetto di ricerca a sé, con hardware Apple reale a disposizione per
-  il reverse engineering iterativo, quando si deciderà di affrontarla.
+- **Fase 2 (ricevitore di mirroring)**: bloccata sul valore `et: 32`
+  nell'ultima `SETUP` — vedi "Stato attuale" sopra per il dettaglio. Prossimi
+  passi realistici, in ordine di quanto sarebbero risolutivi:
+  1. Una cattura di rete di una sessione di mirroring **riuscita** dello
+     stesso iPhone verso un ricevitore vero (Apple TV, o un Mac/AppleTV con
+     Wireshark) per confronto diretto — senza questo, si continua a
+     indovinare alla cieca su `et: 32`.
+  2. Se si trova un altro riferimento open source più recente di UxPlay che
+     documenti `et` valori oltre 0/3/5, riprendere da lì.
+  3. Il decoder/render H.264 vero (Media Foundation) è ancora da scrivere
+     del tutto — utile solo dopo aver risolto il punto sopra, dato che senza
+     una chiave video corretta non c'è niente di valido da decodificare.
+- **Fase 2b (sender di mirroring, Windows → TV)**: non affrontata, R&D
+  ancora più aperta di quanto sopra — nessun progetto open source esiste per
+  questo verso. Vedi la discussione nella cronologia del progetto per la
+  valutazione completa.
 
 ## Licenza e attribuzioni
 

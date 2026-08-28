@@ -1,6 +1,5 @@
-using System.Net;
 using System.Net.NetworkInformation;
-using System.Net.Sockets;
+using AirPlaySender.Core.Net;
 using Zeroconf;
 
 namespace AirPlaySender.Core.Discovery;
@@ -15,8 +14,8 @@ namespace AirPlaySender.Core.Discovery;
 /// host, and merges their TXT records for the same physical device.
 ///
 /// Explicitly scopes which network interfaces the query goes out on
-/// (see <see cref="GetCandidateInterfaces"/>) instead of leaving that to
-/// Windows' own routing/interface-metric choice. A VPN/mesh adapter (e.g.
+/// (see <see cref="CandidateNetworkInterfaces"/>) instead of leaving that
+/// to Windows' own routing/interface-metric choice. A VPN/mesh adapter (e.g.
 /// Tailscale) commonly gets a LOWER interface metric than the real LAN
 /// adapter, which is exactly backwards for link-local mDNS multicast — it
 /// needs to go out on the interface that's actually on the LAN segment the
@@ -31,7 +30,7 @@ public sealed class AirPlayDiscovery
 
     public async Task<IReadOnlyList<AirPlayDevice>> DiscoverAsync(TimeSpan scanTime, CancellationToken cancellationToken = default)
     {
-        NetworkInterface[] candidateInterfaces = GetCandidateInterfaces();
+        NetworkInterface[] candidateInterfaces = CandidateNetworkInterfaces.Get();
         IReadOnlyList<IZeroconfHost> hosts = await ZeroconfResolver.ResolveAsync(
             [RaopServiceType, AirPlayServiceType],
             scanTime: scanTime,
@@ -72,32 +71,6 @@ public sealed class AirPlayDiscovery
             });
         }
         return devices;
-    }
-
-    /// <summary>
-    /// Interfaces worth sending an mDNS query on: up, not loopback, and
-    /// carrying at least one real (non link-local, non-APIPA) IPv4 unicast
-    /// address — i.e. actually configured on a LAN, not a VPN/tunnel
-    /// adapter sitting at a 169.254.x.x fallback address or a disconnected
-    /// Wi-Fi/Ethernet adapter Windows still lists as present.
-    /// </summary>
-    private static NetworkInterface[] GetCandidateInterfaces()
-    {
-        return NetworkInterface.GetAllNetworkInterfaces()
-            .Where(nic => nic.OperationalStatus == OperationalStatus.Up
-                       && nic.NetworkInterfaceType != NetworkInterfaceType.Loopback
-                       && HasRealIPv4Address(nic))
-            .ToArray();
-    }
-
-    private static bool HasRealIPv4Address(NetworkInterface nic) =>
-        nic.GetIPProperties().UnicastAddresses.Any(a =>
-            a.Address.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(a.Address) && !IsLinkLocal(a.Address));
-
-    private static bool IsLinkLocal(IPAddress address)
-    {
-        byte[] b = address.GetAddressBytes();
-        return b[0] == 169 && b[1] == 254; // 169.254.0.0/16 (APIPA / unconfigured)
     }
 
     private static void MergeProperties(Dictionary<string, string> into, IReadOnlyList<IReadOnlyDictionary<string, string>> propertySets)

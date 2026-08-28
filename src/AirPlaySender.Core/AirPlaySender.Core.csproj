@@ -7,6 +7,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Makaretu.Dns.Multicast" Version="0.27.0" />
     <PackageReference Include="NAudio" Version="3.0.1" />
     <PackageReference Include="NSec.Cryptography" Version="26.4.0" />
     <PackageReference Include="Zeroconf" Version="3.7.16" />

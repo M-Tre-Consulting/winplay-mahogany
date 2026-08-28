@@ -18,7 +18,7 @@
         <Grid x:Name="TitleBarArea" Grid.Row="0">
             <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0" Spacing="8">
                 <SymbolIcon Symbol="Video" />
-                <TextBlock Text="AirPlay per Windows" VerticalAlignment="Center" FontSize="14" FontWeight="SemiBold" />
+                <TextBlock Text="WinPlay Mahogany" VerticalAlignment="Center" FontSize="14" FontWeight="SemiBold" />
             </StackPanel>
         </Grid>
 

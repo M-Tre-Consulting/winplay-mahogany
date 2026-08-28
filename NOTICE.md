@@ -28,6 +28,40 @@ Fonte di riferimento incrociato per il parsing dei flag mDNS/TXT AirPlay
 pairing (transient vs PIN vs pair-verify con credenziali salvate), e come
 controllo indipendente sui dettagli del protocollo HAP.
 
+## FDH2/UxPlay (Fase 2 — ricevitore di mirroring)
+
+<https://github.com/FDH2/UxPlay> — Licenza **GPLv3**.
+
+A differenza dei due riferimenti sopra (usati come *ricetta*, non come
+codice), la parte di questo progetto sotto `src/AirPlaySender.Core/Receiving/`
+che implementa il cifrario FairPlay (`FairPlayCipher.cs`,
+`FairPlayCipherTables.g.cs`) è un **porting diretto** del codice sorgente di
+UxPlay (`lib/playfair/{omg_hax.c,omg_hax.h,sap_hash.c,hand_garble.c,
+modified_md5.c,playfair.c}` e `lib/fairplay_playfair.c`), non una
+reimplementazione indipendente seguendo una specifica — perché per questo
+specifico algoritmo non esiste nessuna specifica pubblica da seguire: è
+codice ricavato da disassemblaggio ("OmgHax"), di cui nemmeno UxPlay
+rivendica di aver capito il funzionamento interno, solo di aver osservato
+che riproduce l'output atteso.
+
+Questo rende **questa parte specifica** del progetto un'opera derivata sotto
+licenza GPLv3, non un'implementazione pulita come il resto — un vincolo di
+licenza reale, non solo un'attribuzione di cortesia. Le tabelle sono state
+estratte meccanicamente (non ritrascritte a mano) e verificate byte-per-byte
+con hash SHA-256 incrociati contro la fonte C; la logica in `Garble()` è
+copiata carattere-per-carattere dall'espressione C originale. Il resto della
+Fase 2 (annuncio mDNS, server RTSP, pairing come accessorio, framing dei
+pacchetti video) segue invece la *sequenza* documentata da UxPlay ma è
+scritto da zero, come per i riferimenti Apache/MIT sopra.
+
+**Implicazione pratica**: questo progetto resta un repository privato per
+uso personale/R&D, non distribuito pubblicamente — coerente con quanto
+discusso esplicitamente nella cronologia del progetto. Se in futuro si
+volesse distribuire pubblicamente l'intero progetto, la parte derivata da
+UxPlay dovrebbe essere trattata secondo i termini GPLv3 (es. isolata,
+rilicenziata di conseguenza, o sostituita), a differenza del resto del
+codice che non ha questo vincolo.
+
 ## Come sono stati usati
 
 Il codice in questo repository è stato scritto da zero in C#, seguendo la
@@ -48,3 +82,4 @@ letteralmente.
 | [Zeroconf](https://github.com/novotnyllc/Zeroconf) | MIT | Discovery mDNS/Bonjour (`_raop._tcp`, `_airplay._tcp`) |
 | [NAudio](https://github.com/naudio/NAudio) | MIT | Cattura audio WASAPI loopback + resampling |
 | [Microsoft.WindowsAppSDK](https://github.com/microsoft/WindowsAppSDK) | MIT | WinUI 3 |
+| [Makaretu.Dns.Multicast](https://github.com/richardschneider/net-mdns) | MIT | Annuncio mDNS (`_airplay._tcp`) per la Fase 2 |

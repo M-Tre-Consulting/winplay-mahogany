@@ -25,7 +25,7 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        Title = "AirPlay per Windows";
+        Title = "WinPlay Mahogany";
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(TitleBarArea);
         SystemBackdrop = new MicaBackdrop();

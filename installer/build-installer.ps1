@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Builds a self-contained release of AirPlay per Windows and packages it
+    Builds a self-contained release of WinPlay Mahogany and packages it
     into a single Setup.exe with Inno Setup.
 
 .DESCRIPTION

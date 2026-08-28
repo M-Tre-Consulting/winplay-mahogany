@@ -1,4 +1,4 @@
-; Inno Setup script for "AirPlay per Windows".
+; Inno Setup script for "WinPlay Mahogany".
 ;
 ; Wraps the already-working *unpackaged* `dotnet publish` output into a
 ; single Setup.exe with a Start Menu entry and a proper uninstaller — on
@@ -17,7 +17,7 @@
 ; To edit: bump MyAppVersion below when you want a new version number on
 ; the installer/uninstaller entry; everything else rarely needs to change.
 
-#define MyAppName "AirPlay per Windows"
+#define MyAppName "WinPlay Mahogany"
 #define MyAppVersion "0.1.0"
 #define MyAppPublisher "M-Tre Consulting"
 #define MyAppExeName "AirPlaySender.App.exe"
