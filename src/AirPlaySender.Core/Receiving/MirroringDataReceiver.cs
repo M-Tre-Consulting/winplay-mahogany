@@ -7,11 +7,12 @@ namespace AirPlaySender.Core.Receiving;
 
 /// <summary>
 /// The TCP connection a real device opens after a successful mirroring
-/// <c>SETUP</c> — this is where the actual H.264 video arrives. Not a full
-/// player: this milestone proves the crypto chain end to end (pairing →
-/// FairPlay → per-stream AES-CTR key) by decrypting real frames and
-/// checking for a well-formed H.264 NAL start code, and logs what it sees.
-/// Decode/render is the next, separate milestone.
+/// <c>SETUP</c> — this is where the actual H.264 video arrives. Decrypts
+/// real frames (verified against real hardware: ~2200 consecutive packets,
+/// one real mirroring session, all correct — see README) and hands the
+/// decoded SPS/PPS and each NAL unit to <see cref="ConfigReceived"/>/
+/// <see cref="NalReceived"/> for a renderer to consume; decoding pixels and
+/// drawing them is that renderer's job, not this class's.
 ///
 /// Packet framing (128-byte header + payload) and the AES-CTR video key/iv
 /// derivation are taken from UxPlay's <c>lib/raop_rtp_mirror.c</c>
@@ -26,6 +27,13 @@ public sealed class MirroringDataReceiver : IAsyncDisposable
     private Task? _acceptLoop;
 
     public event Action<string>? Diagnostics;
+
+    /// <summary>Fires once, when the unencrypted AVCDecoderConfigurationRecord packet arrives — the SPS/PPS a renderer needs before it can decode anything. Args: (sps, pps).</summary>
+    public event Action<byte[], byte[]>? ConfigReceived;
+
+    /// <summary>Fires once per decrypted VCL NAL unit (Annex-B-style bytes NOT included — raw NAL, header byte first), in wire order. Args: (nal, isIdr).</summary>
+    public event Action<byte[], bool>? NalReceived;
+
     public int LocalPort { get; }
 
     public MirroringDataReceiver()
@@ -109,13 +117,24 @@ public sealed class MirroringDataReceiver : IAsyncDisposable
 
             if (payloadTypeHigh == 0x01)
             {
-                // Unencrypted SPS+PPS — if this really is well-formed H.264, it starts with a NAL start code immediately.
-                LogNalStartCode(payload, "SPS/PPS");
+                // Unencrypted "SPS+PPS" packet — a real AVCDecoderConfigurationRecord (see AvcDecoderConfig), not a bare NAL pair.
+                (byte[] Sps, byte[] Pps)? config = AvcDecoderConfig.TryParse(payload);
+                if (config is { } c)
+                {
+                    Trace($"  SPS/PPS: config valido (SPS {c.Sps.Length} byte, PPS {c.Pps.Length} byte)");
+                    ConfigReceived?.Invoke(c.Sps, c.Pps);
+                }
+                else
+                {
+                    Trace($"  SPS/PPS: AVCDecoderConfigurationRecord non valido ({Convert.ToHexString(payload.AsSpan(0, Math.Min(8, payload.Length)))}...)");
+                }
             }
             else if (payloadTypeHigh == 0x00 && payloadSize > 0)
             {
                 byte[] decrypted = _videoCipher!.Transform(payload);
-                LogNalStartCode(decrypted, "VCL NAL decifrato");
+                bool isIdr = payloadTypeLow == 0x10;
+                foreach (byte[] nal in AvcDecoderConfig.SplitAvccNalUnits(decrypted))
+                    NalReceived?.Invoke(nal, isIdr);
             }
         }
     }
@@ -129,37 +148,6 @@ public sealed class MirroringDataReceiver : IAsyncDisposable
     // rather than restarting at the IV for each one.
     private AesCtrKeystreamCipher? _videoCipher;
     public void SetVideoKeyIv(byte[] key, byte[] iv) => _videoCipher = new AesCtrKeystreamCipher(key, iv);
-
-    /// <summary>
-    /// Confirmed against a real hardware capture (this project's first real
-    /// mirroring video packets, ever): the mirroring data channel frames
-    /// NALs as AVCC — a 4-byte big-endian length prefix, then exactly that
-    /// many bytes of NAL data — not the Annex-B start-code (<c>00 00 00
-    /// 01</c>) convention this method originally looked for. That original
-    /// check was itself never wrong about the CRYPTO (a correct length
-    /// prefix — verified against the packet's own total size — followed by
-    /// a well-formed NAL header byte is exactly as strong a correctness
-    /// signal), just aimed at the wrong container convention.
-    /// </summary>
-    private void LogNalStartCode(byte[] data, string label)
-    {
-        if (data.Length >= 5)
-        {
-            int avccLength = (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3];
-            if (avccLength == data.Length - 4)
-            {
-                int nalType = data[4] & 0x1F;
-                Trace($"  {label}: AVCC valido (prefisso lunghezza {avccLength} byte corrisponde esattamente), tipo NAL = {nalType} -> crittografia/derivazione chiave corrette");
-                return;
-            }
-        }
-        if (data.Length >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1)
-        {
-            Trace($"  {label}: start code Annex-B trovato (00 00 00 01), tipo NAL = 0x{(data[4] & 0x1F):X2} -> crittografia/derivazione chiave corrette");
-            return;
-        }
-        Trace($"  {label}: né AVCC né Annex-B all'inizio ({Convert.ToHexString(data.AsSpan(0, Math.Min(8, data.Length)))}...) — qualcosa non torna");
-    }
 
     private static async Task<bool> ReadExactAsync(NetworkStream stream, byte[] buffer, int count, CancellationToken ct)
     {
