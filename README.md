@@ -7,8 +7,10 @@ AirPlay nativo per Windows, nei due versi:
   AirPlay 2 di terze parti), con pairing e crittografia reali.
 - **Ricevitore di mirroring** (Fase 2, in corso — vedi sotto): fa comparire
   questo PC come bersaglio "Duplica schermo" nel Centro di Controllo di un
-  iPhone. Pairing e cifratura funzionano fino in fondo; il video vero e
-  proprio no, non ancora, per un motivo specifico e documentato più sotto.
+  iPhone. Pairing, cifratura, **e ora anche il video vero** funzionano fino
+  in fondo — un iPhone reale ha trasmesso un flusso H.264 vero, decifrato
+  correttamente byte per byte, per quasi 2000 pacchetti consecutivi.
+  Manca ancora solo l'ultimo pezzo: decodificarlo e disegnarlo a schermo.
 
 Apple non pubblica API per nessuno dei due versi su piattaforme non Apple.
 Questo progetto ricostruisce i protocolli (pairing HAP, RTSP cifrato,
@@ -63,8 +65,8 @@ del client — utile per non regredire, ma è stato il test contro l'HomePod
 vero a scoprire i bug elencati sopra (nessun test locale può anticipare il
 comportamento di un ricevitore reale).
 
-**Fase 2 — ricevitore di mirroring: pairing e cifratura funzionano fino in
-fondo su hardware reale; il video no, non ancora.** 🧩
+**Fase 2 — ricevitore di mirroring: pairing, cifratura, e ora il video vero
+funzionano fino in fondo su hardware reale.** 🎉
 
 A differenza della Fase 1 (dove esistevano due riferimenti open source
 validati), qui il riferimento principale è [UxPlay](https://github.com/FDH2/UxPlay)
@@ -277,6 +279,42 @@ Max), non solo compilato:
      HAP dopo un pair-verify riuscito (`HapFrameCodec`, già scritto e
      collaudato per l'esperimento sul canale eventi) — non collegato finché
      non c'è un pair-setup capace di arrivarci davvero.
+
+## 🎉 Il video vero funziona (stessa notte)
+
+Fatto un altro test dal vivo con `GET /info` arricchito. Novità enorme,
+mai vista prima in tutto il progetto: **il telefono ha mandato una seconda
+`SETUP` reale con un array `streams` valido** (`streamConnectionID`
+diverso da zero) — non è mai successo, nemmeno con l'offerta proattiva.
+Si è **connesso davvero alla porta dati video**, e la sessione **non è
+andata in TEARDOWN**.
+
+Il canale dati si chiudeva comunque subito: il primo pacchetto veniva
+letto con un `payloadSize` assurdo (603979776) e il nostro codice si
+fermava. Controllato di nuovo il vero `raop_rtp_mirror.c` di UxPlay:
+`payload_size = byteutils_get_int(packet, 0)`, e `byteutils_get_int` è
+**little-endian** (confermato ore prima leggendo `byteutils.c`, mai
+applicato qui) — il nostro codice lo leggeva big-endian. Un solo byte-order
+sbagliato, mai esercitato prima contro un pacchetto vero. Sistemato,
+ridistribuito, riprovato nello stesso test.
+
+**Risultato: quasi 2000 pacchetti video ricevuti consecutivamente, tutti
+decifrati correttamente.** La verifica non è "sembra giusto" — è
+matematica esatta: ogni pacchetto video decifrato inizia con 4 byte che,
+letti come lunghezza big-endian, corrispondono **esattamente** alla
+lunghezza del payload meno 4 (es. pacchetto da 644 byte → prefisso
+`00 00 02 80` = 640 = 644-4), seguiti da un byte di header NAL H.264
+valido. Non è Annex-B (`00 00 00 01`) come UxPlay/la maggior parte dei
+riferimenti — è **AVCC**, lunghezza a 4 byte invece di start code. Un
+formato di framing diverso, non un problema di crittografia: la catena
+pairing → FairPlay → chiave video AES-CTR è verificata corretta su un
+flusso reale, sostenuto, non un singolo pacchetto fortunato.
+`MirroringDataReceiver.LogNalStartCode` ora riconosce entrambi i formati.
+
+Resta l'ultimo pezzo, esplicitamente rimandato dall'inizio della Fase 2:
+un vero decoder/render H.264 (Media Foundation) — oggi il traguardo è
+"riceviamo e decifriamo video vero", non ancora "lo vediamo a schermo".
+Con l'AVCC confermato, però, sappiamo esattamente che formato aspettarci.
 - 🐛 **Bug trovato (non ancora osservabile su hardware)**: una code review
   ha scovato che `MirroringDataReceiver` decifrava ogni pacchetto video
   ripartendo dal blocco 0 del keystream AES-CTR invece di continuarlo —
@@ -456,25 +494,19 @@ verificati empiricamente in questo progetto:
 - **Fase 1.1**: provare contro più dispositivi reali (Apple TV con PIN,
   altri speaker AirPlay 2), system tray icon, rilevazione disconnessione,
   multi-room.
-- **Fase 2 (ricevitore di mirroring)**: la cattura con `rvictl` (vedi "Stato
-  attuale" punto 9) ha cambiato l'impostazione — non più un mistero di
-  protocollo, un pezzo concreto da costruire. In ordine:
-  1. **Pair-setup HAP per il mirroring** — l'unico pezzo del nuovo schema
-     senza nessuna prova reale ancora (la sessione catturata lo saltava).
-     Serve un'altra cattura `rvictl` di un **primo** accoppiamento (non un
-     iPhone già associato a quella TV — o un `pi`/identità diversa lato
-     nostro per forzare un pairing nuovo) per vedere se è transient, PIN, o
-     altro sotto `X-Apple-HKP: 6`.
-  2. Collegare `HapPairVerifyAccessorySession` (già scritto e testato) ad
-     `AirPlayReceiverServer`, avvolgendo l'intero ciclo RTSP successivo in
-     cifratura HAP (`HapFrameCodec`, già scritto per l'esperimento sul
-     canale eventi — va solo riusato sul ciclo principale, non su un canale
-     separato).
-  3. Arricchire `GET /info` con `displays`/`PTPInfo`/`playbackCapabilities`
-     e feature flag più moderni, sul modello di quanto visto dalla TV vera.
-  4. Ritestare dal vivo con la TV/harness nostro una volta che 1-3 esistono.
-  5. Il decoder/render H.264 vero (Media Foundation) è ancora da scrivere
-     del tutto — utile solo dopo aver risolto i punti sopra.
+- **Fase 2 (ricevitore di mirroring)**: video vero ricevuto e decifrato con
+  successo su hardware reale (quasi 2000 pacchetti, AVCC, verificato byte
+  per byte — vedi "Stato attuale"). Resta un solo pezzo grosso:
+  1. **Il decoder/render H.264 vero** (Media Foundation) — sappiamo già che
+     il formato è AVCC (lunghezza a 4 byte + NAL), non Annex-B, quindi il
+     lavoro di decodifica parte da un formato noto, non da un'ipotesi.
+  2. Il pair-setup HAP "vero" (transient collegato ma probabilmente non la
+     forma corretta — vedi sopra) resta un'incognita a bassa priorità ora:
+     il percorso legacy già collegato funziona fino al video vero, quindi
+     non blocca più nulla nell'immediato.
+  3. La sessione dati (porta separata dalla 6030 vista con la TV) potrebbe
+     aver bisogno di gestire riconnessioni/più stream — non ancora
+     osservato un secondo tentativo nella stessa sessione.
 - **Fase 2b (sender di mirroring, Windows → TV)**: non affrontata, R&D
   ancora più aperta di quanto sopra — nessun progetto open source esiste per
   questo verso. Vedi la discussione nella cronologia del progetto per la

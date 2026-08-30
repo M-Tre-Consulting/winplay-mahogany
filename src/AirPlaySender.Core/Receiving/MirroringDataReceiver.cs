@@ -72,7 +72,15 @@ public sealed class MirroringDataReceiver : IAsyncDisposable
                 return;
             }
 
-            int payloadSize = (header[0] << 24) | (header[1] << 16) | (header[2] << 8) | header[3];
+            // Confirmed against UxPlay's real raop_rtp_mirror.c: payload_size =
+            // byteutils_get_int(packet, 0) — byteutils_get_int is little-endian
+            // (byteutils_get_int_be is the separate big-endian variant UxPlay
+            // uses elsewhere, e.g. for the NAL length prefix INSIDE a decrypted
+            // payload). Previously read big-endian here — never actually
+            // exercised against a real packet until tonight, when it decoded a
+            // real small payload size as a huge nonsense value and dropped the
+            // connection the client had, for the first time ever, opened for real.
+            int payloadSize = header[0] | (header[1] << 8) | (header[2] << 16) | (header[3] << 24);
             byte payloadTypeHigh = header[4], payloadTypeLow = header[5];
             if (payloadSize is < 0 or > 8 * 1024 * 1024)
             {
@@ -122,12 +130,35 @@ public sealed class MirroringDataReceiver : IAsyncDisposable
     private AesCtrKeystreamCipher? _videoCipher;
     public void SetVideoKeyIv(byte[] key, byte[] iv) => _videoCipher = new AesCtrKeystreamCipher(key, iv);
 
+    /// <summary>
+    /// Confirmed against a real hardware capture (this project's first real
+    /// mirroring video packets, ever): the mirroring data channel frames
+    /// NALs as AVCC — a 4-byte big-endian length prefix, then exactly that
+    /// many bytes of NAL data — not the Annex-B start-code (<c>00 00 00
+    /// 01</c>) convention this method originally looked for. That original
+    /// check was itself never wrong about the CRYPTO (a correct length
+    /// prefix — verified against the packet's own total size — followed by
+    /// a well-formed NAL header byte is exactly as strong a correctness
+    /// signal), just aimed at the wrong container convention.
+    /// </summary>
     private void LogNalStartCode(byte[] data, string label)
     {
-        if (data.Length >= 5 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1)
-            Trace($"  {label}: start code NAL trovato (00 00 00 01), tipo NAL = 0x{(data[4] & 0x1F):X2} -> crittografia/derivazione chiave corrette");
-        else
-            Trace($"  {label}: NESSUN start code NAL all'inizio ({Convert.ToHexString(data.AsSpan(0, Math.Min(8, data.Length)))}...) — qualcosa non torna");
+        if (data.Length >= 5)
+        {
+            int avccLength = (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3];
+            if (avccLength == data.Length - 4)
+            {
+                int nalType = data[4] & 0x1F;
+                Trace($"  {label}: AVCC valido (prefisso lunghezza {avccLength} byte corrisponde esattamente), tipo NAL = {nalType} -> crittografia/derivazione chiave corrette");
+                return;
+            }
+        }
+        if (data.Length >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1)
+        {
+            Trace($"  {label}: start code Annex-B trovato (00 00 00 01), tipo NAL = 0x{(data[4] & 0x1F):X2} -> crittografia/derivazione chiave corrette");
+            return;
+        }
+        Trace($"  {label}: né AVCC né Annex-B all'inizio ({Convert.ToHexString(data.AsSpan(0, Math.Min(8, data.Length)))}...) — qualcosa non torna");
     }
 
     private static async Task<bool> ReadExactAsync(NetworkStream stream, byte[] buffer, int count, CancellationToken ct)
