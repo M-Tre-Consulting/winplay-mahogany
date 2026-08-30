@@ -245,12 +245,38 @@ Max), non solo compilato:
      notte. `HapPairVerifyAccessorySession` accetta la chiave pubblica
      lunga del client da fuori apposta per questo: è responsabilità di chi
      lo richiama, una volta che il pair-setup esiste, fornire quello che ha
-     imparato lì. Non ancora collegato a `AirPlayReceiverServer` — mancano
-     ancora: il pair-setup vero, avvolgere l'intero ciclo RTSP in cifratura
-     HAP dopo il pair-verify (riusando `HapFrameCodec`, già scritto e
-     collaudato per l'esperimento sul canale eventi), e arricchire
-     `GET /info` con i campi visti sopra. Prossimo passo naturale, non più
-     un mistero.
+     imparato lì.
+
+     **Aggiornamento, stessa notte**: costruito anche
+     `HapPairSetupAccessorySession` — pair-setup lato accessorio, variante
+     *transient* (senza PIN, password fissa "3939", niente scambio di
+     identità — la stessa forma che l'audio di Fase 1 usa già per un
+     HomePod). Riusa la matematica SRP-6a server già collaudata (lo stesso
+     codice, prima solo dentro `FakeAirPlay2Receiver` per i test, ora anche
+     in produzione), verificata di nuovo contro il vero `PairSetupClient` di
+     Fase 1. **Correzione di rotta onesta**: aver visto il pair-verify
+     succedere davvero nella cattura implica quasi certamente che il
+     pair-setup del mirroring NON sia transient — il transient, per
+     definizione, salta il pair-verify e deriva le chiavi direttamente
+     dalla SRP session key. La variante PIN/identità (quella che Fase 1 usa
+     per un Apple TV) è il sospetto più plausibile ora, non ancora
+     costruita (serve anche mostrare un PIN sul nostro harness, che oggi
+     non esiste). Il transient resta comunque collegato al server — a
+     basso rischio, riusa codice già provato — apposta per scoprire dal
+     vivo, senza altro danno che un rifiuto pulito e loggato, se la vera
+     richiesta del telefono porta davvero il flag transient o no.
+     `GET /info` arricchito con `displays` (risoluzione vera dello schermo
+     di questo PC), `deviceID`, `model`, `name`, `pi` — non toccato invece
+     `features`: cambiare quei bit a intuito rischiava di rompere il
+     percorso legacy già funzionante, per un cambiamento non verificabile
+     stanotte. `/pair-setup` ora smista su `X-Apple-HKP: 6` (lo stesso
+     valore visto sul pair-verify reale) verso il nuovo percorso HAP,
+     loggando ogni campo TLV8 anche in caso di rifiuto — così se il
+     telefono lo tenta stasera, si vede la forma vera anche se viene
+     respinto. Ancora da fare: avvolgere l'intero ciclo RTSP in cifratura
+     HAP dopo un pair-verify riuscito (`HapFrameCodec`, già scritto e
+     collaudato per l'esperimento sul canale eventi) — non collegato finché
+     non c'è un pair-setup capace di arrivarci davvero.
 - 🐛 **Bug trovato (non ancora osservabile su hardware)**: una code review
   ha scovato che `MirroringDataReceiver` decifrava ogni pacchetto video
   ripartendo dal blocco 0 del keystream AES-CTR invece di continuarlo —

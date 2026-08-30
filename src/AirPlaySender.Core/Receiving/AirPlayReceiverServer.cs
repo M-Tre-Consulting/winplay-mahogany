@@ -2,7 +2,9 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using AirPlaySender.Core.Crypto;
+using AirPlaySender.Core.Net;
 using AirPlaySender.Core.Plist;
+using AirPlaySender.Core.Tlv;
 
 namespace AirPlaySender.Core.Receiving;
 
@@ -61,6 +63,7 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
         string peer = client.Client.RemoteEndPoint?.ToString() ?? "?";
         Trace($"Connessione accettata da {peer}");
         var pairing = new PairingAccessorySession(_identity);
+        var hapPairSetup = new HapPairSetupAccessorySession();
         var fairplay = new FairPlaySetupSession();
         var mirror = new MirrorSetupState();
         try
@@ -83,7 +86,7 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
 
                 Trace($"{request.Method} {request.Url} (CSeq {request.CSeq})");
                 var remoteAddr = ((IPEndPoint)client.Client.RemoteEndPoint!).Address;
-                (byte[] responseBytes, bool closeAfter) = BuildResponse(request, pairing, fairplay, mirror, remoteAddr);
+                (byte[] responseBytes, bool closeAfter) = BuildResponse(request, pairing, hapPairSetup, fairplay, mirror, remoteAddr);
                 await stream.WriteAsync(responseBytes, ct).ConfigureAwait(false);
                 if (closeAfter)
                 {
@@ -115,13 +118,13 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
         public NtpTimingSession? Timing { get; set; }
     }
 
-    private (byte[] Bytes, bool CloseAfter) BuildResponse(RtspRequest request, PairingAccessorySession pairing, FairPlaySetupSession fairplay, MirrorSetupState mirror, IPAddress remoteAddr)
+    private (byte[] Bytes, bool CloseAfter) BuildResponse(RtspRequest request, PairingAccessorySession pairing, HapPairSetupAccessorySession hapPairSetup, FairPlaySetupSession fairplay, MirrorSetupState mirror, IPAddress remoteAddr)
     {
         return (request.Method, request.Url) switch
         {
             ("OPTIONS", _) => (BuildOptionsResponse(request), false),
             ("GET", var url) when url.Contains("/info") => (BuildInfoResponse(request), false),
-            ("POST", "/pair-setup") => (BuildOctetStreamResponse(request, pairing.HandlePairSetup(request.Body)), false),
+            ("POST", "/pair-setup") => BuildPairSetupResponse(request, pairing, hapPairSetup),
             ("POST", "/pair-verify") => BuildPairVerifyResponse(request, pairing),
             ("POST", "/fp-setup") => BuildFpSetupResponse(request, fairplay),
             ("SETUP", _) => BuildSetupResponse(request, pairing, fairplay, mirror, remoteAddr),
@@ -347,6 +350,38 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
         return [.. Encoding.ASCII.GetBytes(sb.ToString()), .. body];
     }
 
+    /// <summary>
+    /// Dispatches on <c>X-Apple-HKP</c>: <c>6</c> is the value confirmed
+    /// tonight (real capture, a genuine mirroring session) on
+    /// <c>/pair-verify</c> for the modern HAP TLV8 scheme — nothing has
+    /// confirmed it's the same value on <c>/pair-setup</c> yet, this is the
+    /// live test of that. Any other value (or the header's absence, as on
+    /// every request seen from real hardware against this receiver so far)
+    /// keeps using the legacy byte-offset scheme this project has already
+    /// verified end-to-end — this dispatch changes nothing for that path.
+    /// </summary>
+    private (byte[], bool) BuildPairSetupResponse(RtspRequest request, PairingAccessorySession pairing, HapPairSetupAccessorySession hapPairSetup)
+    {
+        if (request.Header("X-Apple-HKP") != "6")
+            return (BuildOctetStreamResponse(request, pairing.HandlePairSetup(request.Body)), false);
+
+        Trace("  pair-setup HAP (X-Apple-HKP: 6) — schema mai confermato per questo verso, vedi HapPairSetupAccessorySession");
+        if (request.Body.Length > 0)
+        {
+            Tlv8.Map req = Tlv8.Decode(request.Body);
+            foreach ((byte tag, byte[] value) in req)
+                Trace($"    TLV8 tag 0x{tag:X2} = {Convert.ToHexString(value)}");
+        }
+
+        byte[]? body = hapPairSetup.Handle(request.Body);
+        if (body is null)
+        {
+            Trace("  pair-setup HAP rifiutato (forma inattesa — vedi il dump TLV8 sopra per la forma reale)");
+            return (BuildStatusResponse(request, 400, "Bad Request"), true);
+        }
+        return (BuildOctetStreamResponse(request, body), false);
+    }
+
     private static (byte[], bool) BuildPairVerifyResponse(RtspRequest request, PairingAccessorySession pairing)
     {
         byte[]? body = pairing.HandlePairVerify(request.Body);
@@ -420,6 +455,32 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
             builder.Add("txtAirPlay", AirPlayTxtRecord.EncodeWire(AirPlayTxtRecord.BuildEntries(_identity, _deviceId, AirPlayMirroringAdvertiser.Model)));
         if (wantsRaopTxt)
             builder.Add("txtRAOP", []); // no RAOP (audio-only) service on this receiver yet — empty, not omitted, matching UxPlay's shape when a device offers no RAOP TXT
+
+        // A real receiver's GET /info carries a MUCH richer top-level dict
+        // than just txtAirPlay — confirmed tonight from a real capture (a
+        // Hisense TV's response was 2538 bytes, ours was ~100). Added here,
+        // unconditional on the qualifier (the real device's response wasn't
+        // gated on it either): deviceID/model/name/pi (already advertised
+        // elsewhere, just not here) plus displays — this PC's actual screen
+        // resolution, not a placeholder, since a client plausibly uses this
+        // to decide whether mirroring here is even worth attempting.
+        // Deliberately NOT touched: "features" — the real device's bitmask
+        // differs from ours, but guessing at which bits matter risks
+        // breaking the legacy path that already works end-to-end, for a
+        // change nobody can verify tonight.
+        (int widthPx, int heightPx) = ScreenResolution.GetPrimary();
+        builder.Add("deviceID", _deviceId);
+        builder.Add("model", AirPlayMirroringAdvertiser.Model);
+        builder.Add("name", _identity.Pi.ToString("N")[..8]); // short, stable, not the machine's real name
+        builder.Add("pi", _identity.Pi.ToString());
+        builder.Add("displays", PlistValue.Array([
+            new PlistDictBuilder()
+                .Add("widthPixels", (long)widthPx)
+                .Add("heightPixels", (long)heightPx)
+                .Add("maxFPS", 60L)
+                .Add("uuid", _identity.Pi.ToString())
+                .Build(),
+        ]));
 
         byte[] body = BinaryPlist.Encode(builder.Build());
 
