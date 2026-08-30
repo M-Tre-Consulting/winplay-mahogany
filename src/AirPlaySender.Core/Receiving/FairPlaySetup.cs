@@ -66,6 +66,14 @@ public sealed class FairPlaySetupSession
     private byte[]? HandleRound2(byte[] request)
     {
         if (request[4] != 0x03) return null;
+        // byte[12] becomes the "mode" FairPlayCipher.Decrypt indexes
+        // message_key/message_iv with, much later during SETUP — those
+        // tables only have 4 entries (found by code review: nothing
+        // validated this, so a malformed round-2 body could crash SETUP
+        // with an unhandled IndexOutOfRangeException instead of a clean
+        // 400 here, where the request is still in hand to reject outright).
+        int mode = request[12];
+        if (mode is < 0 or > 3) return null;
         KeyMessage = (byte[])request.Clone();
         return [.. FpHeader, .. request[144..164]];
     }

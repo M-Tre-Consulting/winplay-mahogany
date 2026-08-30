@@ -145,6 +145,23 @@ Max), non solo compilato:
   confini a 16 byte dei pacchetti) — verificato con test di round-trip e di
   "spezza in punti arbitrari e confronta col colpo unico", non ancora contro
   dati reali.
+- 🐛 **Altri 7 fix da una code-review completa** su tutto il diff di Fase 2
+  (`0be9b59..HEAD`): `EcdhSecret`/`EventChannelKeys` ora tornano `null`
+  finché `pair-verify` non è davvero completato (prima la chiave di sessione
+  poteva essere derivata da un client che aveva superato solo il passo 1,
+  senza mai provare di possedere la chiave privata del passo 2); lunghezza
+  di `ekey` (72 byte) e del byte "mode" del messaggio chiave di `/fp-setup`
+  ora validati prima di finire nel cifrario FairPlay, invece di far esplodere
+  un'eccezione non gestita su input malformato; una seconda `SETUP` sulla
+  stessa connessione ora chiude la sessione di timing/il ricevitore dati
+  precedenti invece di perderne il riferimento; `TEARDOWN`/`PAUSE` (che
+  `OPTIONS` dichiara ma il dispatch non gestiva, finendo in 501) ora
+  rispondono 200; `GET /info` con più qualificatori nello stesso array ora li
+  onora tutti invece di leggere solo il primo. Un'ultima segnalazione (una
+  maschera `& 0xff` mancante in `Rol8x` dentro il cifrario FairPlay)
+  controllata contro il vero `sap_hash.c` di UxPlay ed **esclusa**: l'originale
+  ha davvero quell'asimmetria, non è un errore di trascrizione — lasciata
+  intatta di proposito. 41 test totali, tutti verdi.
 
 Tutto il codice di questa fase vive in `src/AirPlaySender.Core/Receiving/` —
 architettura completa e riutilizzabile, non un tentativo buttato via.

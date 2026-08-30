@@ -127,7 +127,10 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
             ("SETUP", _) => BuildSetupResponse(request, pairing, fairplay, mirror, remoteAddr),
             ("GET_PARAMETER", _) => (BuildGetParameterResponse(request), false),
             ("RECORD", _) => (BuildRecordResponse(request), false),
-            ("SET_PARAMETER" or "FLUSH", _) => (BuildStatusResponse(request, 200, "OK"), false),
+            // OPTIONS advertises both of these in its Public header (matching
+            // UxPlay), but nothing here answered them — found by code review,
+            // they were falling through to 501 instead of 200.
+            ("SET_PARAMETER" or "FLUSH" or "TEARDOWN" or "PAUSE", _) => (BuildStatusResponse(request, 200, "OK"), false),
             _ => (BuildStatusResponse(request, 501, "Not Implemented"), false),
         };
     }
@@ -183,6 +186,14 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
                 Trace("  manca il messaggio chiave di /fp-setup — non posso decifrare ekey");
                 return (BuildStatusResponse(request, 400, "Bad Request"), true);
             }
+            if (ekeyNode.DataValue.Length != 72)
+            {
+                // FairPlayCipher.Decrypt slices this assuming exactly 72 bytes
+                // (chunk1/chunk2) — found by code review: an unexpected length
+                // used to throw an unhandled exception instead of a clean 400.
+                Trace($"  ekey ha lunghezza inattesa ({ekeyNode.DataValue.Length}, attesi 72) — rifiuto");
+                return (BuildStatusResponse(request, 400, "Bad Request"), true);
+            }
 
             byte[] rawKey = FairPlayCipher.Decrypt(fairplay.KeyMessage, ekeyNode.DataValue);
             byte[]? ecdh = pairing.EcdhSecret;
@@ -191,6 +202,22 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
                 : Sha.Sha512([.. rawKey, .. ecdh])[..16];
             mirror.SessionAesKey = sessionKey;
             Trace($"  chiave di sessione decifrata: {Convert.ToHexString(sessionKey)}");
+
+            // A second ekey/eiv-bearing SETUP on the same connection (retry/
+            // renegotiation) would otherwise leak the previous UdpClient and
+            // leave its NtpTimingSession's send loop running forever — found
+            // by code review. BuildSetupResponse is synchronous, so this is a
+            // best-effort fire-and-forget cleanup rather than an awaited one.
+            if (mirror.Timing is not null || mirror.TimingSocket is not null)
+            {
+                NtpTimingSession? oldTiming = mirror.Timing;
+                UdpClient? oldSocket = mirror.TimingSocket;
+                _ = Task.Run(async () =>
+                {
+                    if (oldTiming is not null) { try { await oldTiming.DisposeAsync().ConfigureAwait(false); } catch { } }
+                    oldSocket?.Dispose();
+                });
+            }
 
             mirror.TimingSocket = new UdpClient(0);
             int timingPort = ((IPEndPoint)mirror.TimingSocket.Client.LocalEndPoint!).Port;
@@ -236,6 +263,14 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
                     {
                         Trace("  SETUP stream di mirroring senza una chiave di sessione valida — rifiuto");
                         return (BuildStatusResponse(request, 400, "Bad Request"), true);
+                    }
+
+                    // Same leaked-listener risk as the timing socket above if
+                    // a mirroring stream gets SETUP more than once.
+                    if (mirror.DataReceiver is not null)
+                    {
+                        MirroringDataReceiver oldReceiver = mirror.DataReceiver;
+                        _ = Task.Run(async () => { try { await oldReceiver.DisposeAsync().ConfigureAwait(false); } catch { } });
                     }
 
                     (byte[] videoKey, byte[] videoIv) = MirroringDataReceiver.DeriveVideoKeyIv(mirror.SessionAesKey, streamConnectionId);
@@ -341,11 +376,14 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
         PlistValue? qualifier = reqPlist?.Find("qualifier");
         if (qualifier is { Type: PlistValue.Kind.Array })
         {
-            string? q = qualifier.ArrayValue.FirstOrDefault()?.AsStr();
-            if (q is not null)
+            // A client can ask for both blobs in one qualifier array (e.g.
+            // ["txtAirPlay", "txtRAOP"]) — found by code review: this used
+            // to only look at the first entry and silently drop the rest.
+            var wanted = qualifier.ArrayValue.Select(v => v.AsStr()).Where(q => q is not null).ToHashSet();
+            if (wanted.Count > 0)
             {
-                wantsAirPlayTxt = q == "txtAirPlay";
-                wantsRaopTxt = q == "txtRAOP";
+                wantsAirPlayTxt = wanted.Contains("txtAirPlay");
+                wantsRaopTxt = wanted.Contains("txtRAOP");
             }
         }
 

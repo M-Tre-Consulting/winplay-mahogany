@@ -61,7 +61,7 @@ public sealed class PairingAccessorySession
     /// AES key (see UxPlay's raop_handlers.h: "aeskey must now be hashed
     /// with it" when legacy pairing set up a shared secret).
     /// </summary>
-    public byte[]? EcdhSecret => _ecdhSecret;
+    public byte[]? EcdhSecret => IsVerified ? _ecdhSecret : null;
 
     /// <summary>
     /// Event-channel keys, mirroring <c>Pairing/SessionKeyDerivation.cs</c>
@@ -72,9 +72,9 @@ public sealed class PairingAccessorySession
     /// against a reference for this specific (legacy/mirroring) pairing —
     /// this is past what any available source documents.
     /// </summary>
-    public (byte[] WriteKey, byte[] ReadKey)? EventChannelKeys => _ecdhSecret is null ? null : (
-        Hkdf.DeriveSha512("Events-Salt", "Events-Write-Encryption-Key", _ecdhSecret, 32),
-        Hkdf.DeriveSha512("Events-Salt", "Events-Read-Encryption-Key", _ecdhSecret, 32));
+    public (byte[] WriteKey, byte[] ReadKey)? EventChannelKeys => EcdhSecret is not { } secret ? null : (
+        Hkdf.DeriveSha512("Events-Salt", "Events-Write-Encryption-Key", secret, 32),
+        Hkdf.DeriveSha512("Events-Salt", "Events-Read-Encryption-Key", secret, 32));
 
     /// <summary>Returns the response body, or null to signal "reject — close the connection" (malformed request or a signature that doesn't verify).</summary>
     public byte[]? HandlePairVerify(byte[] body)
