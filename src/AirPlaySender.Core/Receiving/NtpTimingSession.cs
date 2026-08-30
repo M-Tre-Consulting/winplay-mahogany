@@ -94,17 +94,32 @@ public sealed class NtpTimingSession : IAsyncDisposable
         timeoutCts.CancelAfter(300); // matches UxPlay's SO_RCVTIMEO of 300ms
         try
         {
-            UdpReceiveResult result = await _socket.ReceiveAsync(timeoutCts.Token).ConfigureAwait(false);
-            ulong recvNowNs = UnixNowNanoseconds();
-            byte[] response = result.Buffer;
-            if (response.Length < 32)
+            // The socket is bound to IPAddress.Any, not Connect()-ed to
+            // _remote, so it's reachable by anything on the LAN — loop
+            // rather than trusting the first datagram, in case something
+            // else sends this port traffic while we're waiting on the
+            // client's real reply.
+            while (true)
             {
-                Trace($"risposta timing troppo corta ({response.Length} byte), ignorata");
+                UdpReceiveResult result = await _socket.ReceiveAsync(timeoutCts.Token).ConfigureAwait(false);
+                if (!result.RemoteEndPoint.Equals(_remote))
+                {
+                    Trace($"pacchetto timing da {result.RemoteEndPoint}, non dal client atteso ({_remote}) — ignorato");
+                    continue;
+                }
+
+                ulong recvNowNs = UnixNowNanoseconds();
+                byte[] response = result.Buffer;
+                if (response.Length < 32)
+                {
+                    Trace($"risposta timing troppo corta ({response.Length} byte), ignorata");
+                    continue;
+                }
+                _clientRefTimeRaw = BinaryPrimitives.ReadUInt64BigEndian(response.AsSpan(24, 8));
+                _lastLocalRecvNs = recvNowNs;
+                Trace($"risposta timing ricevuta da {result.RemoteEndPoint}");
                 return;
             }
-            _clientRefTimeRaw = BinaryPrimitives.ReadUInt64BigEndian(response.AsSpan(24, 8));
-            _lastLocalRecvNs = recvNowNs;
-            Trace($"risposta timing ricevuta da {result.RemoteEndPoint}");
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {

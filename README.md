@@ -47,9 +47,10 @@ dettagli, in breve:
   ancora, resta in attesa e il SETUP non risponde mai. Bastava invertire
   l'ordine.
 
-Tutta la parte protocollare (`src/AirPlaySender.Core`) ha **37 test
-automatici** (i 6 più recenti coprono il formato dei pacchetti di
-`NtpTimingSession`, Fase 2), incluso un test end-to-end che fa girare `AirPlaySession`
+Tutta la parte protocollare (`src/AirPlaySender.Core`) ha **41 test
+automatici** (i 10 più recenti coprono il formato dei pacchetti di
+`NtpTimingSession` e la correttezza di `AesCtrKeystreamCipher`, Fase 2),
+incluso un test end-to-end che fa girare `AirPlaySession`
 contro un *finto ricevitore AirPlay 2* scritto da zero apposta per i test
 (`FakeAirPlay2Receiver`): un server TCP/UDP indipendente che implementa il
 lato server di SRP-6a e la sequenza RTSP/bplist, senza riusare il codice
@@ -133,6 +134,17 @@ Max), non solo compilato:
   manca a noi soli. Le piste verificabili leggendo codice sono esaurite; il
   prossimo passo utile è una cattura di traffico di una sessione riuscita
   (stesso iPhone verso un vero Apple TV) per confronto diretto.
+- 🐛 **Bug trovato (non ancora osservabile su hardware)**: una code review
+  ha scovato che `MirroringDataReceiver` decifrava ogni pacchetto video
+  ripartendo dal blocco 0 del keystream AES-CTR invece di continuarlo —
+  avrebbe rotto la decodifica dal secondo pacchetto in poi. Mai emerso nei
+  test perché il canale dati mirroring non ha ancora mai ricevuto un
+  pacchetto vero (il blocco sopra impedisce di arrivarci). Corretto con
+  `AesCtrKeystreamCipher`, un cifrario con stato che replica esattamente
+  `mirror_buffer_decrypt` di UxPlay (portare avanti il keystream oltre i
+  confini a 16 byte dei pacchetti) — verificato con test di round-trip e di
+  "spezza in punti arbitrari e confronta col colpo unico", non ancora contro
+  dati reali.
 
 Tutto il codice di questa fase vive in `src/AirPlaySender.Core/Receiving/` —
 architettura completa e riutilizzabile, non un tentativo buttato via.

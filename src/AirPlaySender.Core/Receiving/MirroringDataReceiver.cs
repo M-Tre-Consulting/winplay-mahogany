@@ -106,7 +106,7 @@ public sealed class MirroringDataReceiver : IAsyncDisposable
             }
             else if (payloadTypeHigh == 0x00 && payloadSize > 0)
             {
-                byte[] decrypted = AesCtrCipher.Transform(DeriveVideoKeyIvCached().Key, DeriveVideoKeyIvCached().Iv, blockOffset: 0, payload);
+                byte[] decrypted = _videoCipher!.Transform(payload);
                 LogNalStartCode(decrypted, "VCL NAL decifrato");
             }
         }
@@ -114,10 +114,13 @@ public sealed class MirroringDataReceiver : IAsyncDisposable
 
     // Set by the caller right after construction, once the stream-level SETUP
     // (which carries streamConnectionID) has told us what key to derive — see
-    // AirPlayReceiverServer.
-    private (byte[] Key, byte[] Iv)? _videoKeyIv;
-    private (byte[] Key, byte[] Iv) DeriveVideoKeyIvCached() => _videoKeyIv!.Value;
-    public void SetVideoKeyIv(byte[] key, byte[] iv) => _videoKeyIv = (key, iv);
+    // AirPlayReceiverServer. One AesCtrKeystreamCipher per connection: the
+    // video data channel is a single continuous AES-CTR byte stream split
+    // across packets of arbitrary (non-16-byte-aligned) length, so the
+    // keystream position has to carry across ReadPacketsAsync's packets
+    // rather than restarting at the IV for each one.
+    private AesCtrKeystreamCipher? _videoCipher;
+    public void SetVideoKeyIv(byte[] key, byte[] iv) => _videoCipher = new AesCtrKeystreamCipher(key, iv);
 
     private void LogNalStartCode(byte[] data, string label)
     {
