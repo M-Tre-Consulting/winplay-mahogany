@@ -47,12 +47,14 @@ dettagli, in breve:
   ancora, resta in attesa e il SETUP non risponde mai. Bastava invertire
   l'ordine.
 
-Tutta la parte protocollare (`src/AirPlaySender.Core`) ha **42 test
-automatici** (gli 11 più recenti coprono il formato dei pacchetti di
-`NtpTimingSession`, la correttezza di `AesCtrKeystreamCipher`, e un test di
+Tutta la parte protocollare (`src/AirPlaySender.Core`) ha **43 test
+automatici** (gli ultimi coprono il formato dei pacchetti di
+`NtpTimingSession`, la correttezza di `AesCtrKeystreamCipher`, un test di
 regressione per `FairPlayCipher.Decrypt` con i byte veri — `KeyMessage`,
 `ekey` e la chiave risultante — catturati da una sessione reale con
-l'iPhone, non più solo verificato a mano durante il debug live; Fase 2),
+l'iPhone, e un test che fa girare `HapPairVerifyAccessorySession` (il vero
+pair-verify HAP lato accessorio, scoperto stanotte con `rvictl`) contro il
+`PairVerifyClient` di Fase 1, non modificato, su un socket reale; Fase 2),
 incluso un test end-to-end che fa girare `AirPlaySession`
 contro un *finto ricevitore AirPlay 2* scritto da zero apposta per i test
 (`FakeAirPlay2Receiver`): un server TCP/UDP indipendente che implementa il
@@ -175,14 +177,80 @@ Max), non solo compilato:
 
   Con `osVersion: 26.6.1`, `sourceVersion: 960.13.1`, tutto indica che questo
   iOS usa per il mirroring uno schema che nessun progetto open source
-  disponibile pubblicamente documenta o implementa — non è un dettaglio che
-  manca a noi soli. Le piste verificabili leggendo codice, guardando il
-  traffico reale della nostra sessione, e provando a catturarne una riuscita
-  sono tutte esaurite con gli strumenti disponibili (solo Windows, nessun
-  Mac). L'unico passo realistico rimasto, se mai un giorno capitasse
-  l'occasione, è ripetere il confronto con accesso a un Mac (interfaccia
-  `awdl0`) — altrimenti la Fase 2 resta ferma qui, documentata a fondo
-  invece che abbandonata a metà.
+  disponibile pubblicamente documenta o implementa. **Aggiornamento — vedi il
+  punto 9 sotto: questo era vero fino a stanotte. Con un Mac e `rvictl` la
+  sessione riuscita si è vista per davvero, e cambia l'impostazione di tutta
+  la Fase 2.**
+  9. **La svolta**: `awdl0` di un Mac non coinvolto vede solo il proprio
+     traffico (punto 8), ma su iOS esiste lo strumento fatto apposta per
+     questo, usato dagli sviluppatori Apple stessi — **`rvictl`** (Xcode),
+     che crea un'interfaccia virtuale (`rvi0`) che rispecchia *alla fonte*
+     tutto il traffico dell'iPhone, prima che scelga Wi-Fi normale o AWDL.
+     Collegato l'iPhone al Mac via USB, catturato con
+     `sudo tcpdump -i rvi0` durante un mirroring vero verso la TV, e
+     **stavolta la sessione RTSP reale si vede per intero**, in chiaro
+     (salvo le firme di pairing) — sulla Wi-Fi normale (`en0`), non su
+     AWDL. Un'ora scarsa di lavoro per far funzionare `rvictl` (non era nel
+     `PATH` — trovato a mano in `/Library/Apple/usr/bin/rvictl`), poi un
+     parser scritto da zero in Python per il formato `pcapng`/`PKTAP` che
+     `tcpdump` su macOS produce di default (niente `tshark`/Wireshark
+     disponibili). Quello che si è visto, punto per punto:
+     - **`GET /info` vero è enorme** (2538 byte, contro le poche decine di
+       byte del nostro): contiene `displays` (risoluzione, HDR, `maxFPS`),
+       `PTPInfo` (Precision Time Protocol — non NTP), `playbackCapabilities`,
+       `deviceID`, e feature flag molto più ricchi
+       (`0x7F8AD0,0x38BCF46` contro il nostro `0x5A7FFEE6,0x0`).
+     - **Il pairing è HAP TLV8 vero**, non lo schema legacy a offset di byte
+       di UxPlay — **confermato byte per byte**, non un'ipotesi: il primo
+       messaggio di `/pair-verify` decodifica esattamente come
+       `Method(0x00)=7`, `State(0x06)=1`, `PublicKey(0x03)=<32 byte>`, 40
+       byte totali = `Content-Length: 40` dell'header, nessun avanzo. È lo
+       **stesso identico fondamento crittografico già costruito e
+       collaudato in Fase 1** per l'audio (X25519 + Ed25519 + TLV8), solo
+       mai applicato al ruolo di accessorio per il mirroring. Header
+       `X-Apple-HKP: 6` — un valore mai visto nel codice esistente (Fase 1
+       usa 3 per il PIN e 4 per il transient): quasi certamente un terzo
+       contesto di pairing dedicato al mirroring.
+     - **Dopo il pair-verify, tutta la connessione RTSP diventa cifrata**
+       (SETUP, RECORD, GET_PARAMETER compresi — pacchetti binari illeggibili
+       da lì in poi). UxPlay lascia tutto in chiaro dopo il pairing: questo
+       è probabilmente il pezzo strutturale più importante che mancava.
+     - Il video vero passa su **una connessione TCP separata** (porta 6030
+       in questa sessione, 6550 pacchetti) — la struttura che avevamo già
+       assunto giusta, confermata.
+     - Durante lo streaming, **piccoli messaggi cifrati periodici** sul
+       canale di controllo (keepalive/polling ogni pochi secondi); la
+       sessione si chiude con un **FIN pulito iniziato dal telefono** quando
+       si ferma il mirroring — non un TEARDOWN plist come nel nostro flusso.
+
+     **Cosa è stato costruito stanotte stessa, partendo da questo:**
+     `HapPairVerifyAccessorySession` (`src/AirPlaySender.Core/Receiving/`) —
+     il pair-verify HAP TLV8 lato accessorio, immagine speculare esatta di
+     `Pairing.PairVerifyClient` di Fase 1 (stessi tag TLV8, stesse stringhe
+     HKDF, stessi nonce ChaCha20-Poly1305 "PV-Msg02"/"PV-Msg03", solo i passi
+     scambiati). Verificato **non a occhio ma con un test vero**
+     (`HapPairVerifyAccessorySessionTests`): fa girare il codice nuovo contro
+     il vero `PairVerifyClient` di Fase 1, non modificato, su un socket TCP
+     di loopback reale — stesso trucco già usato da `FakeAirPlay2Receiver`,
+     stavolta nella direzione opposta. Entrambi i lati arrivano
+     indipendentemente alla stessa chiave condivisa e alle stesse chiavi di
+     sessione. 43 test totali, tutti verdi.
+
+     **Cosa resta apertamente non risolto, per onestà**: il *pair-setup* di
+     questo schema — la sessione catturata lo saltava (telefono già
+     associato alla TV da prima), quindi non c'è nessuna prova reale di che
+     forma abbia (transient come l'audio, PIN come Apple TV, o qualcos'altro
+     sotto lo stesso HKP=6 mai visto) — costruirlo a intuito avrebbe ripetuto
+     esattamente l'errore che questa indagine ha cercato di evitare tutta la
+     notte. `HapPairVerifyAccessorySession` accetta la chiave pubblica
+     lunga del client da fuori apposta per questo: è responsabilità di chi
+     lo richiama, una volta che il pair-setup esiste, fornire quello che ha
+     imparato lì. Non ancora collegato a `AirPlayReceiverServer` — mancano
+     ancora: il pair-setup vero, avvolgere l'intero ciclo RTSP in cifratura
+     HAP dopo il pair-verify (riusando `HapFrameCodec`, già scritto e
+     collaudato per l'esperimento sul canale eventi), e arricchire
+     `GET /info` con i campi visti sopra. Prossimo passo naturale, non più
+     un mistero.
 - 🐛 **Bug trovato (non ancora osservabile su hardware)**: una code review
   ha scovato che `MirroringDataReceiver` decifrava ogni pacchetto video
   ripartendo dal blocco 0 del keystream AES-CTR invece di continuarlo —
@@ -362,22 +430,25 @@ verificati empiricamente in questo progetto:
 - **Fase 1.1**: provare contro più dispositivi reali (Apple TV con PIN,
   altri speaker AirPlay 2), system tray icon, rilevazione disconnessione,
   multi-room.
-- **Fase 2 (ricevitore di mirroring)**: bloccata dopo `RECORD`/`TEARDOWN` —
-  vedi "Stato attuale" sopra per l'elenco completo delle 8 ipotesi già
-  verificate ed escluse contro hardware reale, inclusa la cattura di una
-  sessione riuscita (fermata da AWDL — vedi punto 8). Con gli strumenti
-  disponibili oggi (solo Windows, nessun Mac) non ci sono altre piste
-  verificabili concretamente:
-  1. Se un giorno diventa disponibile un Mac, ripetere il confronto
-     catturando l'interfaccia `awdl0` durante una sessione riuscita — è
-     l'unica via nota per vedere davvero questo traffico.
-  2. Se si trova un altro riferimento open source più recente di UxPlay (i
-     due controllati finora, `moieric11/AirPlay-Windows` e
-     `xenos1337/AirPlayServer`, non aggiungono nulla — vedi sopra), riprendere
-     da lì.
-  3. Il decoder/render H.264 vero (Media Foundation) è ancora da scrivere
-     del tutto — utile solo dopo aver risolto uno dei punti sopra, dato che
-     senza una chiave video corretta non c'è niente di valido da decodificare.
+- **Fase 2 (ricevitore di mirroring)**: la cattura con `rvictl` (vedi "Stato
+  attuale" punto 9) ha cambiato l'impostazione — non più un mistero di
+  protocollo, un pezzo concreto da costruire. In ordine:
+  1. **Pair-setup HAP per il mirroring** — l'unico pezzo del nuovo schema
+     senza nessuna prova reale ancora (la sessione catturata lo saltava).
+     Serve un'altra cattura `rvictl` di un **primo** accoppiamento (non un
+     iPhone già associato a quella TV — o un `pi`/identità diversa lato
+     nostro per forzare un pairing nuovo) per vedere se è transient, PIN, o
+     altro sotto `X-Apple-HKP: 6`.
+  2. Collegare `HapPairVerifyAccessorySession` (già scritto e testato) ad
+     `AirPlayReceiverServer`, avvolgendo l'intero ciclo RTSP successivo in
+     cifratura HAP (`HapFrameCodec`, già scritto per l'esperimento sul
+     canale eventi — va solo riusato sul ciclo principale, non su un canale
+     separato).
+  3. Arricchire `GET /info` con `displays`/`PTPInfo`/`playbackCapabilities`
+     e feature flag più moderni, sul modello di quanto visto dalla TV vera.
+  4. Ritestare dal vivo con la TV/harness nostro una volta che 1-3 esistono.
+  5. Il decoder/render H.264 vero (Media Foundation) è ancora da scrivere
+     del tutto — utile solo dopo aver risolto i punti sopra.
 - **Fase 2b (sender di mirroring, Windows → TV)**: non affrontata, R&D
   ancora più aperta di quanto sopra — nessun progetto open source esiste per
   questo verso. Vedi la discussione nella cronologia del progetto per la
