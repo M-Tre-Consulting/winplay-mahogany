@@ -47,9 +47,12 @@ dettagli, in breve:
   ancora, resta in attesa e il SETUP non risponde mai. Bastava invertire
   l'ordine.
 
-Tutta la parte protocollare (`src/AirPlaySender.Core`) ha **41 test
-automatici** (i 10 più recenti coprono il formato dei pacchetti di
-`NtpTimingSession` e la correttezza di `AesCtrKeystreamCipher`, Fase 2),
+Tutta la parte protocollare (`src/AirPlaySender.Core`) ha **42 test
+automatici** (gli 11 più recenti coprono il formato dei pacchetti di
+`NtpTimingSession`, la correttezza di `AesCtrKeystreamCipher`, e un test di
+regressione per `FairPlayCipher.Decrypt` con i byte veri — `KeyMessage`,
+`ekey` e la chiave risultante — catturati da una sessione reale con
+l'iPhone, non più solo verificato a mano durante il debug live; Fase 2),
 incluso un test end-to-end che fa girare `AirPlaySession`
 contro un *finto ricevitore AirPlay 2* scritto da zero apposta per i test
 (`FakeAirPlay2Receiver`): un server TCP/UDP indipendente che implementa il
