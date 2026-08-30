@@ -47,8 +47,9 @@ dettagli, in breve:
   ancora, resta in attesa e il SETUP non risponde mai. Bastava invertire
   l'ordine.
 
-Tutta la parte protocollare (`src/AirPlaySender.Core`) ha **31 test
-automatici**, incluso un test end-to-end che fa girare `AirPlaySession`
+Tutta la parte protocollare (`src/AirPlaySender.Core`) ha **37 test
+automatici** (i 6 più recenti coprono il formato dei pacchetti di
+`NtpTimingSession`, Fase 2), incluso un test end-to-end che fa girare `AirPlaySession`
 contro un *finto ricevitore AirPlay 2* scritto da zero apposta per i test
 (`FakeAirPlay2Receiver`): un server TCP/UDP indipendente che implementa il
 lato server di SRP-6a e la sequenza RTSP/bplist, senza riusare il codice

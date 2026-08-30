@@ -70,19 +70,7 @@ public sealed class NtpTimingSession : IAsyncDisposable
         Trace($"avvio scambio timing con {_remote}");
         while (!ct.IsCancellationRequested)
         {
-            var request = new byte[32];
-            request[0] = 0x80;
-            request[1] = 0xd2;
-            request[2] = 0x00;
-            request[3] = 0x07;
-
-            ulong sendTimeNs = UnixNowNanoseconds();
-            if (_clientRefTimeRaw is { } refTime && _lastLocalRecvNs is { } recvNs)
-            {
-                BinaryPrimitives.WriteUInt64BigEndian(request.AsSpan(8, 8), refTime);
-                WriteNtpTimestamp(request, 16, recvNs);
-            }
-            WriteNtpTimestamp(request, 24, sendTimeNs);
+            byte[] request = BuildRequestPacket(UnixNowNanoseconds(), _clientRefTimeRaw, _lastLocalRecvNs);
 
             try
             {
@@ -127,6 +115,31 @@ public sealed class NtpTimingSession : IAsyncDisposable
         {
             Trace($"errore ricezione timing: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Builds one 32-byte timing request packet — the pure, testable core of
+    /// <see cref="RunAsync"/>'s send step, with no socket/timing dependency.
+    /// <paramref name="clientRefTimeRaw"/>/<paramref name="lastLocalRecvNs"/>
+    /// are null on the very first request of a session (bytes 8-23 stay
+    /// zero, exactly like UxPlay's <c>raop_ntp_thread</c> before its first
+    /// <c>recv_time</c> exists).
+    /// </summary>
+    public static byte[] BuildRequestPacket(ulong sendTimeNs, ulong? clientRefTimeRaw, ulong? lastLocalRecvNs)
+    {
+        var request = new byte[32];
+        request[0] = 0x80;
+        request[1] = 0xd2;
+        request[2] = 0x00;
+        request[3] = 0x07;
+
+        if (clientRefTimeRaw is { } refTime && lastLocalRecvNs is { } recvNs)
+        {
+            BinaryPrimitives.WriteUInt64BigEndian(request.AsSpan(8, 8), refTime);
+            WriteNtpTimestamp(request, 16, recvNs);
+        }
+        WriteNtpTimestamp(request, 24, sendTimeNs);
+        return request;
     }
 
     private static void WriteNtpTimestamp(byte[] buf, int offset, ulong nsSince1970)
