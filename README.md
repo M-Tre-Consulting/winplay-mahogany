@@ -151,15 +151,38 @@ Max), non solo compilato:
      offerta non viene comunque mai contattata, ma è comunque il
      comportamento corretto da tenere. Anche il corpo del `TEARDOWN` è stato
      decodificato: un dizionario vuoto, nessun codice di errore o motivo.
+  8. **Tentata la cattura di una sessione riuscita** (iPhone → una vera Hisense
+     TV `50A5FE-ELL10404`, AirPlay nativo, mirroring che *funziona* per
+     l'utente): questo PC è collegato via Ethernet, quindi trasformato in
+     hotspot Wi-Fi (Impostazioni → Hotspot mobile, condividendo l'Ethernet
+     sulla scheda Wi-Fi) così sia l'iPhone sia la TV ci passano attraverso e
+     tutto il loro traffico è visibile con `pktmon` senza nessun trucco da
+     MITM — il PC è letteralmente il router. Fatta la cattura sulla
+     sottorete dell'hotspot (`192.168.137.0/24`) durante un mirroring
+     riuscito verso la TV. Risultato: **si vede solo la scoperta mDNS**
+     (l'iPhone trova `TV._airplay._tcp.local.` su `192.168.137.238`) — **zero
+     traffico applicativo** tra i due dispositivi dopo quello, nessuna
+     connessione TCP, nessun RTSP. Spiegazione più probabile: iPhone e TV,
+     una volta trovati via mDNS sulla rete "ufficiale", sono passati ad
+     **AWDL** (Apple Wireless Direct Link) — il collegamento Wi-Fi
+     peer-to-peer diretto tra chip Apple che AirPlay preferisce spesso anche
+     stando sulla stessa rete — che bypassa completamente il punto di
+     accesso a livello radio. Anche essendo noi il router, quel traffico non
+     ci passa mai attraverso: non è un errore di impostazione, è un limite
+     tecnico reale del protocollo. L'unico modo noto per catturare AWDL è
+     l'interfaccia `awdl0` esposta da macOS (usata da chi ha reverse-engineered
+     AirPlay/AirDrop in passato) — non disponibile con solo hardware Windows.
 
   Con `osVersion: 26.6.1`, `sourceVersion: 960.13.1`, tutto indica che questo
   iOS usa per il mirroring uno schema che nessun progetto open source
   disponibile pubblicamente documenta o implementa — non è un dettaglio che
-  manca a noi soli. Le piste verificabili leggendo codice (e ora anche
-  quelle verificabili guardando il traffico reale) sono esaurite; il
-  prossimo passo utile resta una cattura di una sessione **riuscita** (stesso
-  iPhone verso un vero Apple TV) per confronto diretto byte-per-byte con
-  quella che abbiamo già.
+  manca a noi soli. Le piste verificabili leggendo codice, guardando il
+  traffico reale della nostra sessione, e provando a catturarne una riuscita
+  sono tutte esaurite con gli strumenti disponibili (solo Windows, nessun
+  Mac). L'unico passo realistico rimasto, se mai un giorno capitasse
+  l'occasione, è ripetere il confronto con accesso a un Mac (interfaccia
+  `awdl0`) — altrimenti la Fase 2 resta ferma qui, documentata a fondo
+  invece che abbandonata a metà.
 - 🐛 **Bug trovato (non ancora osservabile su hardware)**: una code review
   ha scovato che `MirroringDataReceiver` decifrava ogni pacchetto video
   ripartendo dal blocco 0 del keystream AES-CTR invece di continuarlo —
@@ -340,20 +363,21 @@ verificati empiricamente in questo progetto:
   altri speaker AirPlay 2), system tray icon, rilevazione disconnessione,
   multi-room.
 - **Fase 2 (ricevitore di mirroring)**: bloccata dopo `RECORD`/`TEARDOWN` —
-  vedi "Stato attuale" sopra per l'elenco completo delle 6 ipotesi già
-  verificate ed escluse contro hardware reale. Prossimi passi realistici, in
-  ordine di quanto sarebbero risolutivi:
-  1. Una cattura di rete di una sessione di mirroring **riuscita** dello
-     stesso iPhone verso un ricevitore vero (Apple TV, o un Mac/AppleTV con
-     Wireshark) per confronto diretto — le piste verificabili leggendo solo
-     codice sono esaurite, serve un dato di verità a terra.
+  vedi "Stato attuale" sopra per l'elenco completo delle 8 ipotesi già
+  verificate ed escluse contro hardware reale, inclusa la cattura di una
+  sessione riuscita (fermata da AWDL — vedi punto 8). Con gli strumenti
+  disponibili oggi (solo Windows, nessun Mac) non ci sono altre piste
+  verificabili concretamente:
+  1. Se un giorno diventa disponibile un Mac, ripetere il confronto
+     catturando l'interfaccia `awdl0` durante una sessione riuscita — è
+     l'unica via nota per vedere davvero questo traffico.
   2. Se si trova un altro riferimento open source più recente di UxPlay (i
      due controllati finora, `moieric11/AirPlay-Windows` e
      `xenos1337/AirPlayServer`, non aggiungono nulla — vedi sopra), riprendere
      da lì.
   3. Il decoder/render H.264 vero (Media Foundation) è ancora da scrivere
-     del tutto — utile solo dopo aver risolto il punto sopra, dato che senza
-     una chiave video corretta non c'è niente di valido da decodificare.
+     del tutto — utile solo dopo aver risolto uno dei punti sopra, dato che
+     senza una chiave video corretta non c'è niente di valido da decodificare.
 - **Fase 2b (sender di mirroring, Windows → TV)**: non affrontata, R&D
   ancora più aperta di quanto sopra — nessun progetto open source esiste per
   questo verso. Vedi la discussione nella cronologia del progetto per la
