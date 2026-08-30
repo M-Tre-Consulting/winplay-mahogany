@@ -40,6 +40,13 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.6.250108002" />
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.1742" />
+    <!-- Tray icon for "stays running in the background" behavior. 2.4.1 (the
+         newest stable release on NuGet — 2.4.2/2.5.0 only exist as -dev/-beta
+         prereleases as of writing) dropped net9.0 support in favor of
+         net10.0-windows, which this project (net9.0-windows10.0.19041.0)
+         can't consume — 2.3.2 is the newest stable release still built for
+         net9.0-windows. -->
+    <PackageReference Include="H.NotifyIcon.WinUI" Version="2.3.2" />
   </ItemGroup>
 
   <ItemGroup>

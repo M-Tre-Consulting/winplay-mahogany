@@ -22,6 +22,11 @@ public sealed partial class MainWindow : Window
     private AirPlaySession? _activeSession;
     private DeviceItem? _activeItem;
 
+    // Set only by ExitApplication (the tray menu's "Esci"), never by the
+    // window's own X button — that's the whole point of "runs in the
+    // background, closable only from the tray icon".
+    private bool _reallyExiting;
+
     public MainWindow()
     {
         InitializeComponent();
@@ -30,8 +35,83 @@ public sealed partial class MainWindow : Window
         SetTitleBar(TitleBarArea);
         SystemBackdrop = new MicaBackdrop();
         SetWindowIcon();
+        SetupTrayIcon();
+        Closed += OnWindowClosed;
 
         _ = ScanAsync();
+    }
+
+    /// <summary>
+    /// The window's X button/Alt+F4 hides instead of exiting — the mirroring
+    /// receiver (advertising + RTSP server, owned by <see cref="App"/>) has to
+    /// keep running so "PC-NICO" stays discoverable while the app is in the
+    /// background. Only <see cref="ExitApplication"/> (the tray menu's "Esci")
+    /// actually ends the process.
+    /// </summary>
+    private void OnWindowClosed(object sender, WindowEventArgs args)
+    {
+        if (_reallyExiting) return;
+        args.Handled = true;
+        HideToTray();
+    }
+
+    /// <summary>Hides the window without closing it — the tray icon (and the mirroring receiver behind it) keeps running.</summary>
+    public void HideToTray() => GetAppWindow().Hide();
+
+    private void ShowMainWindow()
+    {
+        AppWindow appWindow = GetAppWindow();
+        appWindow.Show();
+        Activate();
+    }
+
+    private void ExitApplication()
+    {
+        // Application.Exit() (not just Close()) so it also tears down any open
+        // MirrorWindow instances, not just this one — Close() would only ever
+        // end the process if this happened to be the last open window.
+        _reallyExiting = true;
+        Application.Current.Exit();
+    }
+
+    private AppWindow GetAppWindow()
+    {
+        nint hwnd = WindowNative.GetWindowHandle(this);
+        WindowId windowId = Win32Interop.GetWindowIdFromWindow(hwnd);
+        return AppWindow.GetFromWindowId(windowId);
+    }
+
+    // H.NotifyIcon.WinUI's default ContextMenuMode (PopupMenu) renders the
+    // menu as a native win32 popup built from each MenuFlyoutItem's Command —
+    // it never raises the item's Click event — so this has to be Command-based,
+    // which is easiest to get right in code rather than via XAML/x:Bind.
+    private void SetupTrayIcon()
+    {
+        var openItem = new MenuFlyoutItem { Text = "Apri", Command = new RelayCommand(ShowMainWindow) };
+        var exitItem = new MenuFlyoutItem { Text = "Esci", Command = new RelayCommand(ExitApplication) };
+        TrayIcon.ContextFlyout = new MenuFlyout { Items = { openItem, exitItem } };
+        TrayIcon.LeftClickCommand = new RelayCommand(ShowMainWindow);
+
+        try
+        {
+            string iconPath = Path.Combine(AppContext.BaseDirectory, "Assets", "AppIcon.ico");
+            if (File.Exists(iconPath)) TrayIcon.Icon = new System.Drawing.Icon(iconPath);
+        }
+        catch { /* cosmetic only — the tray icon still works with the library's default */ }
+    }
+
+    /// <summary>
+    /// Minimal parameterless ICommand — this app has no MVVM/command infrastructure
+    /// elsewhere, and doesn't need one just for two tray menu items. Fully-qualified
+    /// (rather than a `using System.Windows.Input;`) because that namespace's own
+    /// InputScope/InputScopeName/InputScopeNameValue would otherwise collide with the
+    /// WinUI ones this file already uses unqualified in HandlePinRequiredAsync.
+    /// </summary>
+    private sealed class RelayCommand(Action execute) : System.Windows.Input.ICommand
+    {
+        public event EventHandler? CanExecuteChanged { add { } remove { } }
+        public bool CanExecute(object? parameter) => true;
+        public void Execute(object? parameter) => execute();
     }
 
     // App is unpackaged (WindowsPackageType=None), so unlike a packaged WinUI 3

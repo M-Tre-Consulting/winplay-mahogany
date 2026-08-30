@@ -32,6 +32,9 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
 
     public event Action<string>? Diagnostics;
 
+    /// <summary>Fires whenever a mirroring data receiver is stood up for a stream (proactive or client-requested) — the hook a UI uses to open a render window and subscribe to that receiver's own <see cref="MirroringDataReceiver.ConfigReceived"/>/<see cref="MirroringDataReceiver.NalReceived"/>.</summary>
+    public event Action<MirroringDataReceiver>? MirroringSessionStarted;
+
     public AirPlayReceiverServer(int port, ReceiverIdentity identity, string deviceId)
     {
         _listener = new TcpListener(IPAddress.Any, port);
@@ -273,6 +276,7 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
                 receiver.Diagnostics += msg => Trace($"  [dati mirroring] {msg}");
                 receiver.Start();
                 mirror.DataReceiver = receiver;
+                MirroringSessionStarted?.Invoke(receiver);
                 Trace($"  in ascolto su porta dati {receiver.LocalPort}");
                 res.Add("streams", PlistValue.Array([
                     new PlistDictBuilder().Add("dataPort", (long)receiver.LocalPort).Add("type", 110L).Build(),
@@ -310,6 +314,7 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
                     receiver.Diagnostics += msg => Trace($"  [dati mirroring] {msg}");
                     receiver.Start();
                     mirror.DataReceiver = receiver;
+                    MirroringSessionStarted?.Invoke(receiver);
                     Trace($"  stream mirroring: streamConnectionID={streamConnectionId}, in ascolto su porta dati {receiver.LocalPort}");
 
                     resStreams.Add(new PlistDictBuilder()
