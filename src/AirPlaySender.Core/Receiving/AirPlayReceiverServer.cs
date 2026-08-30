@@ -247,6 +247,34 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
             {
                 Trace("  il client non ha inviato un proprio timingPort — nessuno scambio timing da avviare");
             }
+
+            // Confermato con una cattura di rete reale (pktmon, non a
+            // intuito): questo client manda UNA SOLA SETUP — quella con
+            // ekey/eiv — e non ne manda mai una seconda con un array
+            // "streams". Offrire comunque la porta dati qui è la cosa
+            // corretta da fare (senza, non avevamo mai detto al client di
+            // sapere fare mirroring) — ma anche con questo, la stessa
+            // cattura ripetuta subito dopo mostra lo stesso RECORD->TEARDOWN
+            // di sempre, e la porta offerta non viene mai contattata. Non è
+            // quindi (da sola) la causa del blocco, resta comunque il
+            // comportamento corretto da tenere. streamConnectionID=0 replica
+            // ciò che fa UxPlay quando il campo non arriva affatto (resta al
+            // suo valore di default).
+            bool isMirroring = req.Find("isScreenMirroringSession")?.BoolValue ?? false;
+            if (isMirroring && req.Find("streams") is not { Type: PlistValue.Kind.Array })
+            {
+                Trace("  isScreenMirroringSession=true, nessun array streams in questa richiesta — offro la porta dati qui stesso (streamConnectionID=0)");
+                (byte[] videoKey, byte[] videoIv) = MirroringDataReceiver.DeriveVideoKeyIv(sessionKey, 0);
+                var receiver = new MirroringDataReceiver();
+                receiver.SetVideoKeyIv(videoKey, videoIv);
+                receiver.Diagnostics += msg => Trace($"  [dati mirroring] {msg}");
+                receiver.Start();
+                mirror.DataReceiver = receiver;
+                Trace($"  in ascolto su porta dati {receiver.LocalPort}");
+                res.Add("streams", PlistValue.Array([
+                    new PlistDictBuilder().Add("dataPort", (long)receiver.LocalPort).Add("type", 110L).Build(),
+                ]));
+            }
         }
 
         PlistValue? streamsNode = req.Find("streams");

@@ -107,7 +107,11 @@ Max), non solo compilato:
   escluse (nessuna ha cambiato il comportamento RECORD→TEARDOWN):
   1. `timingPort` reale invece di 0 — nessun cambiamento.
   2. Offrire proattivamente la porta dati mirroring senza che il client la
-     chieda — nessun cambiamento; rimosso (UxPlay reale non lo fa mai).
+     chieda — nessun cambiamento osservato nella prima prova (fatta prima
+     che esistesse un vero scambio di timing); poi **confermato necessario**
+     da una cattura di rete reale (punto 7 sotto) e reintrodotto — ma anche
+     con le condizioni corrette alle spalle, non basta da solo a sbloccare
+     RECORD→TEARDOWN.
   3. Un canale eventi reale e cifrato (stessa convenzione HKDF "Events-Salt"
      della Fase 1) — il client si connetteva, ma comunque TEARDOWN; rimosso,
      `eventPort` è tornato al valore letterale `0` che UxPlay stesso invia
@@ -130,13 +134,32 @@ Max), non solo compilato:
      fermo allo stesso punto nostro) e `xenos1337/AirPlayServer` (non è
      codice nuovo: è lo stesso codice C di UxPlay/RPiPlay ricompilato per
      Windows, nessuna soluzione aggiuntiva).
+  7. **Cattura di rete reale** (`pktmon`, con privilegi di amministratore —
+     la shell di Claude Code non li ha, serve farlo dall'utente) della
+     sessione che fallisce contro il nostro stesso PC. Risultato netto:
+     **nessun canale nascosto** — il telefono parla solo con la porta 7000
+     (RTSP) e scambia i pacchetti di timing UDP già noti; niente tentativi
+     di connessione ad altre porte, nessun ICMP, chiusura TCP pulita
+     (FIN/FIN-ACK reciproco, non un RST). Decodificando i byte grezzi dei
+     pacchetti (in chiaro salvo le firme di pairing) si è scoperto un fatto
+     concreto prima non visibile dai soli log applicativi: **il client manda
+     una sola `SETUP`** — quella con `ekey`/`eiv` — e mai una seconda con un
+     array `streams`. Il nostro codice, prima di questo, rispondeva solo con
+     `timingPort`/`eventPort`: non avevamo mai offerto una porta dati.
+     Reintrodotta l'offerta proattiva (punto 2 sopra) con le condizioni
+     ora corrette (timing vero, eventPort=0 di riferimento) — la porta dati
+     offerta non viene comunque mai contattata, ma è comunque il
+     comportamento corretto da tenere. Anche il corpo del `TEARDOWN` è stato
+     decodificato: un dizionario vuoto, nessun codice di errore o motivo.
 
   Con `osVersion: 26.6.1`, `sourceVersion: 960.13.1`, tutto indica che questo
   iOS usa per il mirroring uno schema che nessun progetto open source
   disponibile pubblicamente documenta o implementa — non è un dettaglio che
-  manca a noi soli. Le piste verificabili leggendo codice sono esaurite; il
-  prossimo passo utile è una cattura di traffico di una sessione riuscita
-  (stesso iPhone verso un vero Apple TV) per confronto diretto.
+  manca a noi soli. Le piste verificabili leggendo codice (e ora anche
+  quelle verificabili guardando il traffico reale) sono esaurite; il
+  prossimo passo utile resta una cattura di una sessione **riuscita** (stesso
+  iPhone verso un vero Apple TV) per confronto diretto byte-per-byte con
+  quella che abbiamo già.
 - 🐛 **Bug trovato (non ancora osservabile su hardware)**: una code review
   ha scovato che `MirroringDataReceiver` decifrava ogni pacchetto video
   ripartendo dal blocco 0 del keystream AES-CTR invece di continuarlo —
