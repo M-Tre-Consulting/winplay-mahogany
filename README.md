@@ -7,10 +7,13 @@ AirPlay nativo per Windows, nei due versi:
   AirPlay 2 di terze parti), con pairing e crittografia reali.
 - **Ricevitore di mirroring** (Fase 2, in corso — vedi sotto): fa comparire
   questo PC come bersaglio "Duplica schermo" nel Centro di Controllo di un
-  iPhone. Pairing, cifratura, **e ora anche il video vero** funzionano fino
-  in fondo — un iPhone reale ha trasmesso un flusso H.264 vero, decifrato
-  correttamente byte per byte, per quasi 2000 pacchetti consecutivi.
-  Manca ancora solo l'ultimo pezzo: decodificarlo e disegnarlo a schermo.
+  iPhone, restando raggiungibile anche in background (icona nel tray, avvio
+  automatico con Windows). Pairing, cifratura, **e il video vero**
+  funzionano fino in fondo — un iPhone reale ha trasmesso un flusso H.264
+  vero, decifrato correttamente byte per byte, per quasi 2000 pacchetti
+  consecutivi. La pipeline di rendering (`MirrorWindow`, dimensioni native
+  lette dalla SPS) è costruita e compila pulita; manca ancora l'ultimo
+  passo — verificarla dal vivo contro un mirroring reale.
 
 Apple non pubblica API per nessuno dei due versi su piattaforme non Apple.
 Questo progetto ricostruisce i protocolli (pairing HAP, RTSP cifrato,
@@ -309,7 +312,6 @@ riferimenti — è **AVCC**, lunghezza a 4 byte invece di start code. Un
 formato di framing diverso, non un problema di crittografia: la catena
 pairing → FairPlay → chiave video AES-CTR è verificata corretta su un
 flusso reale, sostenuto, non un singolo pacchetto fortunato.
-`MirroringDataReceiver.LogNalStartCode` ora riconosce entrambi i formati.
 
 Resta l'ultimo pezzo, esplicitamente rimandato dall'inizio della Fase 2:
 un vero decoder/render H.264 (Media Foundation) — oggi il traguardo è
@@ -347,6 +349,72 @@ Con l'AVCC confermato, però, sappiamo esattamente che formato aspettarci.
 Tutto il codice di questa fase vive in `src/AirPlaySender.Core/Receiving/` —
 architettura completa e riutilizzabile, non un tentativo buttato via.
 
+## Il rendering, il funzionamento in background e l'avvio con Windows
+
+Continuazione della stessa notte, partendo dai quasi 2000 pacchetti video
+veri decifrati qui sopra: costruita la pipeline che li trasforma davvero in
+un'immagine a schermo, e il comportamento "app in background" richiesto
+esplicitamente — restare raggiungibile mentre è ridotta a icona, avviarsi
+da sola con Windows, aprire una finestra a dimensioni native quando arriva
+un mirroring vero.
+
+- **`H264Sps.TryParseDimensions`** — parser vero della SPS H.264 (Exp-Golomb,
+  rimozione degli emulation-prevention byte, il ramo esteso di High Profile
+  con `chroma_format_idc`/bit depth/matrice di scaling, formula
+  larghezza/altezza standard coi valori di cropping). Rifiuta esplicitamente
+  (ritorna `false`, non un numero a caso) quando `seq_scaling_matrix_present_flag`
+  è impostato — fuori scopo dichiarato, non un tentativo di indovinare.
+  Verificato bit per bit contro una SPS 1280×720 baseline scritta a mano,
+  non contro dati inventati.
+- **`AvcDecoderConfig`** — il pacchetto "SPS+PPS" non cifrato non è una
+  semplice coppia di NAL: è un vero
+  `AVCDecoderConfigurationRecord` (ISO/IEC 14496-15 §5.2.4.1) — versione,
+  profilo/livello, byte di lunghezza, SPS/PPS con prefisso di lunghezza a 2
+  byte. `SplitAvccNalUnits` spezza poi ogni payload video decifrato nei suoi
+  NAL (prefisso di lunghezza a 4 byte big-endian, confermato contro i
+  pacchetti reali di stanotte).
+- **`MirroringDataReceiver`** riscritto da "logga quello che vede" a
+  espositore di eventi (`ConfigReceived`, `NalReceived`) — un
+  renderer si aggancia e riceve SPS/PPS e ogni NAL già decifrato e
+  spacchettato, senza dover conoscere i dettagli del framing AVCC.
+- **`MirrorWindow`** — la finestra che mostra davvero lo schermo del
+  telefono: si aggancia agli eventi di cui sopra, ridimensiona la finestra
+  alle dimensioni vere lette dalla SPS (fallback 1920×1080 se il parser
+  rifiuta), e alimenta una `MediaStreamSource` di WinRT
+  (`VideoEncodingProperties.CreateH264()`) dentro un `MediaPlayerElement` —
+  decodifica H.264 e resa a schermo affidate al sistema operativo
+  (accelerata via hardware), non reinventate a mano. Un dettaglio non ovvio,
+  confermato contro un'integrazione reale (`webrtc-uwp`) prima di scriverlo:
+  `CreateH264()` vuole **Annex-B** (`00 00 00 01`), non l'AVCC che il resto
+  della pipeline usa — ogni campione viene ri-incapsulato al volo.
+- **Icona nel tray, chiusura che nasconde invece di terminare, avvio con
+  Windows** — la richiesta esplicita era che il programma resti
+  raggiungibile ("PC-NICO" scopribile nel mirroring) anche a finestra
+  chiusa, chiudibile per davvero solo dal tray. `MainWindow` intercetta
+  `Closed` e chiama `AppWindow.Hide()` invece di lasciar terminare il
+  processo, a meno che non sia stato il menu del tray stesso ("Esci") a
+  chiedere l'uscita vera (`Application.Current.Exit()`). Icona via
+  **H.NotifyIcon.WinUI 2.3.2** (l'ultima versione stabile che supporta
+  ancora `net9.0-windows` — la 2.4.1, più recente, richiede `net10.0-windows`,
+  incompatibile col resto del progetto). Un dettaglio non ovvio della
+  libreria, verificato leggendone il sorgente prima di scriverci codice
+  contro: la modalità `ContextMenuMode` di default (`PopupMenu`) costruisce
+  un vero menu nativo win32 a partire dal **`Command`** di ogni
+  `MenuFlyoutItem` — non solleva mai il suo evento `Click`, quindi il menu
+  "Apri"/"Esci" è cablato su due `ICommand` minimi scritti a mano, non su
+  gestori di evento. `StartupRegistration` scrive la voce
+  nella chiave `Run` di `HKEY_CURRENT_USER` (nessun privilegio admin,
+  nessun pacchetto MSIX/attività di Task Scheduler — coerente con
+  l'app non pacchettizzata) con l'argomento `--minimized`, riscritta a ogni
+  avvio così si autoripara se l'eseguibile cambia percorso.
+
+**Verificato finora**: l'intero progetto App (incluso `MirrorWindow`) compila
+senza errori né warning, la suite di test di `AirPlaySender.Core` passa
+tutta (52/52). **Non ancora verificato**: che `MirrorWindow` mostri
+davvero un fotogramma vero a schermo durante un mirroring reale — l'unico
+pezzo di questa parte di lavoro mai ancora messo alla prova contro
+l'hardware, in attesa di un test dal vivo col telefono.
+
 ## Architettura
 
 ```
@@ -364,13 +432,20 @@ src/
       AirPlayMirroringAdvertiser.cs   annuncio mDNS _airplay._tcp
       AirPlayReceiverServer.cs        server RTSP: OPTIONS/GET info/SETUP/RECORD/...
       PairingAccessorySession.cs      pairing come accessorio (schema legacy, non HAP TLV8)
+      HapPairVerifyAccessorySession.cs  pair-verify HAP TLV8 vero, lato accessorio
+      HapPairSetupAccessorySession.cs   pair-setup HAP TLV8, variante transient (ipotesi, non confermata dal vivo)
       FairPlaySetup.cs                handshake /fp-setup (replay di byte catturati da UxPlay)
       FairPlayCipher.cs               il cifrario FairPlay vero, portato da UxPlay/OmgHax
       FairPlayCipherTables.g.cs       le sue tabelle S-box, estratte meccanicamente (non a mano)
-      MirroringDataReceiver.cs        canale dati video (TCP), framing pacchetti + decrypt
+      MirroringDataReceiver.cs        canale dati video (TCP), framing pacchetti + decrypt, espone ConfigReceived/NalReceived
+      AvcDecoderConfig.cs             AVCDecoderConfigurationRecord + split dei NAL AVCC
+      H264Sps.cs                      parser SPS H.264 → larghezza/altezza vere
     AirPlaySession.cs      orchestratore Fase 1: connect → pair → handshake → stream
 
-  AirPlaySender.App/      app WinUI 3 (finestra, lista dispositivi, dialog PIN, volume)
+  AirPlaySender.App/      app WinUI 3 (finestra, lista dispositivi, dialog PIN, volume,
+                           icona nel tray, MirrorWindow per il rendering del mirroring)
+    MirrorWindow.xaml(.cs)   finestra di rendering: MediaStreamSource H.264, dimensioni native
+    StartupRegistration.cs   voce nella chiave Run di HKCU per l'avvio con Windows
 
 tests/
   AirPlaySender.Core.Tests/
@@ -492,14 +567,18 @@ verificati empiricamente in questo progetto:
 ## Roadmap
 
 - **Fase 1.1**: provare contro più dispositivi reali (Apple TV con PIN,
-  altri speaker AirPlay 2), system tray icon, rilevazione disconnessione,
-  multi-room.
+  altri speaker AirPlay 2), rilevazione disconnessione, multi-room.
 - **Fase 2 (ricevitore di mirroring)**: video vero ricevuto e decifrato con
   successo su hardware reale (quasi 2000 pacchetti, AVCC, verificato byte
-  per byte — vedi "Stato attuale"). Resta un solo pezzo grosso:
-  1. **Il decoder/render H.264 vero** (Media Foundation) — sappiamo già che
-     il formato è AVCC (lunghezza a 4 byte + NAL), non Annex-B, quindi il
-     lavoro di decodifica parte da un formato noto, non da un'ipotesi.
+  per byte — vedi "Il video vero funziona"); pipeline di rendering
+  (`MirrorWindow`, `MediaStreamSource`), icona nel tray, chiusura che
+  nasconde invece di terminare, e avvio automatico con Windows tutti
+  costruiti e verificati a compilazione — vedi "Il rendering, il
+  funzionamento in background e l'avvio con Windows". Resta:
+  1. **Il test dal vivo di `MirrorWindow` contro un mirroring reale** — mai
+     ancora messo alla prova che un fotogramma vero arrivi davvero a schermo,
+     l'unico pezzo di tutta questa fase non ancora verificato contro
+     l'hardware.
   2. Il pair-setup HAP "vero" (transient collegato ma probabilmente non la
      forma corretta — vedi sopra) resta un'incognita a bassa priorità ora:
      il percorso legacy già collegato funziona fino al video vero, quindi
