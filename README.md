@@ -92,18 +92,46 @@ Max), non solo compilato:
   carattere-per-carattere dal C, con solo i cast che C# richiede e che C
   faceva implicitamente.
 - ⏳ **Il blocco attuale**: dopo `SETUP`/`RECORD`, l'iPhone fa `TEARDOWN`
-  senza mai aprire la connessione dati video vera. Ho provato diverse
-  ipotesi verificabili (una `timingPort` reale invece di 0, offrire
-  proattivamente la porta dati, un canale eventi reale e cifrato con la
-  stessa convenzione HKDF "Events-Salt" della Fase 1) — nessuna ha cambiato
-  il comportamento. L'indizio più concreto: il campo `et` (tipo di
+  senza mai aprire la connessione dati video vera. Il campo `et` (tipo di
   cifratura) nella richiesta `SETUP` vale **32**, un valore che non compare
-  in nessun riferimento disponibile (UxPlay conosce solo 0/3/5). Con
-  `osVersion: 26.6.1`, `sourceVersion: 960.13.1`, è plausibile che questo
-  iOS usi per il mirroring uno schema di cifratura più recente di quello
-  che qualunque progetto open source documenta oggi — a differenza di tutto
-  il resto sopra, qui non c'è modo di verificare un'ipotesi senza una
-  cattura di traffico di una sessione riuscita per confronto.
+  in nessun riferimento disponibile — ma leggendo il vero codice sorgente di
+  UxPlay (non solo la sua doc) si scopre che `et` non viene **mai** letto da
+  `raop_handler_setup`: non è lui a decidere niente, quindi rincorrerlo come
+  causa diretta era una pista sbagliata.
+  Ipotesi verificate una per una contro hardware reale, tutte esplicitamente
+  escluse (nessuna ha cambiato il comportamento RECORD→TEARDOWN):
+  1. `timingPort` reale invece di 0 — nessun cambiamento.
+  2. Offrire proattivamente la porta dati mirroring senza che il client la
+     chieda — nessun cambiamento; rimosso (UxPlay reale non lo fa mai).
+  3. Un canale eventi reale e cifrato (stessa convenzione HKDF "Events-Salt"
+     della Fase 1) — il client si connetteva, ma comunque TEARDOWN; rimosso,
+     `eventPort` è tornato al valore letterale `0` che UxPlay stesso invia
+     ("the event port is not used in mirror mode or audio mode").
+  4. **La modalità "AirPlay2 Remote Control"** che UxPlay riconosce
+     esplicitamente ma dichiara di non supportare (`isRemoteControlOnly`) —
+     controllata sulla richiesta reale del dispositivo: **assente**. La
+     forma della richiesta è del tutto standard (`timingProtocol: NTP`,
+     `timingPort` valorizzata, nessun `isRemoteControlOnly`) — esclusa.
+  5. **Lo scambio di clock-sync vero** (`NtpTimingSession.cs`, protocollo
+     letto riga per riga da `raop_ntp.c`/`byteutils.c` di UxPlay — scoperta:
+     è il *ricevitore* a dover interrogare periodicamente la `timingPort`
+     del client, non il contrario, un dettaglio che prima mancava del tutto
+     — quella porta veniva aperta e lasciata muta). Verificato che lo
+     scambio funziona per davvero (risposta bidirezionale ricevuta
+     dall'iPhone), ma anche questo non cambia l'esito: TEARDOWN comunque.
+  6. Controllati altri due progetti Windows indipendenti che tentano la
+     stessa cosa: `moieric11/AirPlay-Windows` (la sua stessa doc ammette che
+     la decrittazione dello stream mirroring "remains unimplemented" — è
+     fermo allo stesso punto nostro) e `xenos1337/AirPlayServer` (non è
+     codice nuovo: è lo stesso codice C di UxPlay/RPiPlay ricompilato per
+     Windows, nessuna soluzione aggiuntiva).
+
+  Con `osVersion: 26.6.1`, `sourceVersion: 960.13.1`, tutto indica che questo
+  iOS usa per il mirroring uno schema che nessun progetto open source
+  disponibile pubblicamente documenta o implementa — non è un dettaglio che
+  manca a noi soli. Le piste verificabili leggendo codice sono esaurite; il
+  prossimo passo utile è una cattura di traffico di una sessione riuscita
+  (stesso iPhone verso un vero Apple TV) per confronto diretto.
 
 Tutto il codice di questa fase vive in `src/AirPlaySender.Core/Receiving/` —
 architettura completa e riutilizzabile, non un tentativo buttato via.
@@ -255,15 +283,18 @@ verificati empiricamente in questo progetto:
 - **Fase 1.1**: provare contro più dispositivi reali (Apple TV con PIN,
   altri speaker AirPlay 2), system tray icon, rilevazione disconnessione,
   multi-room.
-- **Fase 2 (ricevitore di mirroring)**: bloccata sul valore `et: 32`
-  nell'ultima `SETUP` — vedi "Stato attuale" sopra per il dettaglio. Prossimi
-  passi realistici, in ordine di quanto sarebbero risolutivi:
+- **Fase 2 (ricevitore di mirroring)**: bloccata dopo `RECORD`/`TEARDOWN` —
+  vedi "Stato attuale" sopra per l'elenco completo delle 6 ipotesi già
+  verificate ed escluse contro hardware reale. Prossimi passi realistici, in
+  ordine di quanto sarebbero risolutivi:
   1. Una cattura di rete di una sessione di mirroring **riuscita** dello
      stesso iPhone verso un ricevitore vero (Apple TV, o un Mac/AppleTV con
-     Wireshark) per confronto diretto — senza questo, si continua a
-     indovinare alla cieca su `et: 32`.
-  2. Se si trova un altro riferimento open source più recente di UxPlay che
-     documenti `et` valori oltre 0/3/5, riprendere da lì.
+     Wireshark) per confronto diretto — le piste verificabili leggendo solo
+     codice sono esaurite, serve un dato di verità a terra.
+  2. Se si trova un altro riferimento open source più recente di UxPlay (i
+     due controllati finora, `moieric11/AirPlay-Windows` e
+     `xenos1337/AirPlayServer`, non aggiungono nulla — vedi sopra), riprendere
+     da lì.
   3. Il decoder/render H.264 vero (Media Foundation) è ancora da scrivere
      del tutto — utile solo dopo aver risolto il punto sopra, dato che senza
      una chiave video corretta non c'è niente di valido da decodificare.

@@ -82,7 +82,8 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
                 }
 
                 Trace($"{request.Method} {request.Url} (CSeq {request.CSeq})");
-                (byte[] responseBytes, bool closeAfter) = BuildResponse(request, pairing, fairplay, mirror);
+                var remoteAddr = ((IPEndPoint)client.Client.RemoteEndPoint!).Address;
+                (byte[] responseBytes, bool closeAfter) = BuildResponse(request, pairing, fairplay, mirror, remoteAddr);
                 await stream.WriteAsync(responseBytes, ct).ConfigureAwait(false);
                 if (closeAfter)
                 {
@@ -98,86 +99,23 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
         finally
         {
             if (mirror.DataReceiver is not null) await mirror.DataReceiver.DisposeAsync().ConfigureAwait(false);
+            if (mirror.Timing is not null) await mirror.Timing.DisposeAsync().ConfigureAwait(false);
             mirror.TimingSocket?.Dispose();
-            mirror.EventListener?.Stop();
             client.Dispose();
             Trace($"Connessione con {peer} chiusa");
         }
     }
 
-    /// <summary>Per-connection state that only SETUP fills in: the FairPlay-decrypted session AES key and the mirror data listener.</summary>
+    /// <summary>Per-connection state that only SETUP fills in: the FairPlay-decrypted session AES key, the mirror data listener, and the timing exchange.</summary>
     private sealed class MirrorSetupState
     {
         public byte[]? SessionAesKey { get; set; }
         public MirroringDataReceiver? DataReceiver { get; set; }
         public UdpClient? TimingSocket { get; set; }
-        public TcpListener? EventListener { get; set; }
+        public NtpTimingSession? Timing { get; set; }
     }
 
-    /// <summary>
-    /// The eventPort connection, treated as HAP-encrypted (see
-    /// <see cref="PairingAccessorySession.EventChannelKeys"/>) — decrypts
-    /// whatever the client pushes and, if it looks like an RTSP request
-    /// (has a CSeq), answers an encrypted bare 200 OK, mirroring exactly
-    /// what this project's own <see cref="Rtsp.AirPlayEventChannel"/> does
-    /// from the controller side (confirmed against a real HomePod in
-    /// Phase 1) — just with the reversed key pair now that we're the
-    /// accessory. Unverified whether this specific pairing flow (the
-    /// mirroring one) uses the same key-derivation convention; this is the
-    /// experiment that tests it.
-    /// </summary>
-    private void StartEventListener(TcpListener listener, byte[] writeKey, byte[] readKey)
-    {
-        CancellationToken ct = _cts.Token;
-        _ = Task.Run(async () =>
-        {
-            ulong sendCounter = 0, recvCounter = 0;
-            var rxEncrypted = new List<byte>();
-            var rxPlain = new List<byte>();
-            try
-            {
-                using TcpClient client = await listener.AcceptTcpClientAsync(ct).ConfigureAwait(false);
-                Trace($"  [canale eventi] connessione accettata da {client.Client.RemoteEndPoint}");
-                var buf = new byte[8192];
-                NetworkStream stream = client.GetStream();
-                while (!ct.IsCancellationRequested)
-                {
-                    int n = await stream.ReadAsync(buf, ct).ConfigureAwait(false);
-                    if (n == 0) { Trace("  [canale eventi] chiuso dal client"); break; }
-                    rxEncrypted.AddRange(buf.AsSpan(0, n).ToArray());
-
-                    while (true)
-                    {
-                        byte[]? plaintext;
-                        try { plaintext = HapFrameCodec.TryDecryptNextFrame(readKey, ref recvCounter, rxEncrypted); }
-                        catch (IOException ex) { Trace($"  [canale eventi] decrittazione fallita: {ex.Message}"); return; }
-                        if (plaintext is null) break;
-                        rxPlain.AddRange(plaintext);
-                        Trace($"  [canale eventi] decifrato: {Encoding.ASCII.GetString(plaintext).Replace("\r\n", " | ")}");
-                    }
-
-                    string text = Encoding.ASCII.GetString([.. rxPlain]);
-                    int headEnd = text.IndexOf("\r\n\r\n", StringComparison.Ordinal);
-                    if (headEnd >= 0)
-                    {
-                        string? cseq = text[..headEnd].Split('\n')
-                            .Select(l => l.Trim()).FirstOrDefault(l => l.StartsWith("CSeq:", StringComparison.OrdinalIgnoreCase))
-                            ?.Split(':', 2)[1].Trim();
-                        rxPlain.RemoveRange(0, headEnd + 4);
-                        string resp = "RTSP/1.0 200 OK\r\nServer: AirPlay/220.68\r\n" + (cseq is not null ? $"CSeq: {cseq}\r\n" : "") + "\r\n";
-                        byte[] frame = HapFrameCodec.EncryptFrame(writeKey, ref sendCounter, Encoding.ASCII.GetBytes(resp));
-                        await stream.WriteAsync(frame, ct).ConfigureAwait(false);
-                        Trace("  [canale eventi] risposto 200 OK cifrato");
-                    }
-                }
-            }
-            catch (OperationCanceledException) { }
-            catch (ObjectDisposedException) { }
-            catch (Exception ex) { Trace($"  [canale eventi] errore: {ex.Message}"); }
-        }, ct);
-    }
-
-    private (byte[] Bytes, bool CloseAfter) BuildResponse(RtspRequest request, PairingAccessorySession pairing, FairPlaySetupSession fairplay, MirrorSetupState mirror)
+    private (byte[] Bytes, bool CloseAfter) BuildResponse(RtspRequest request, PairingAccessorySession pairing, FairPlaySetupSession fairplay, MirrorSetupState mirror, IPAddress remoteAddr)
     {
         return (request.Method, request.Url) switch
         {
@@ -186,7 +124,7 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
             ("POST", "/pair-setup") => (BuildOctetStreamResponse(request, pairing.HandlePairSetup(request.Body)), false),
             ("POST", "/pair-verify") => BuildPairVerifyResponse(request, pairing),
             ("POST", "/fp-setup") => BuildFpSetupResponse(request, fairplay),
-            ("SETUP", _) => BuildSetupResponse(request, pairing, fairplay, mirror),
+            ("SETUP", _) => BuildSetupResponse(request, pairing, fairplay, mirror, remoteAddr),
             ("GET_PARAMETER", _) => (BuildGetParameterResponse(request), false),
             ("RECORD", _) => (BuildRecordResponse(request), false),
             ("SET_PARAMETER" or "FLUSH", _) => (BuildStatusResponse(request, 200, "OK"), false),
@@ -200,12 +138,20 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
     /// and re-hash it with the pair-verify ECDH secret) and/or a stream-level
     /// call (has a <c>streams</c> array — for <c>type: 110</c>/Mirroring,
     /// derive the per-connection video AES-CTR key and open the TCP data
-    /// listener a real device connects to next). Shape confirmed against
-    /// UxPlay's <c>raop_handler_setup</c> — see the doc comment on
-    /// <see cref="AirPlayMirroringAdvertiser"/> for this project's
-    /// attribution convention.
+    /// listener a real device connects to next). Shape read line-by-line from
+    /// UxPlay's actual <c>raop_handler_setup</c> (not just its docs) — see
+    /// the doc comment on <see cref="AirPlayMirroringAdvertiser"/> for this
+    /// project's attribution convention. Two things earlier experiments got
+    /// wrong, corrected once the real reference source was read closely:
+    /// <c>eventPort</c> is UxPlay's own literal <c>0</c> ("the event port is
+    /// not used in mirror mode or audio mode" — no real listener), and the
+    /// response never proactively adds a <c>streams</c> entry the request
+    /// didn't ask for. What real UxPlay hardware DOES actively do that this
+    /// project never had until now: run <see cref="NtpTimingSession"/> —
+    /// send it periodic clock-sync requests on the very socket whose port we
+    /// hand back as <c>timingPort</c>, instead of leaving that socket idle.
     /// </summary>
-    private (byte[], bool) BuildSetupResponse(RtspRequest request, PairingAccessorySession pairing, FairPlaySetupSession fairplay, MirrorSetupState mirror)
+    private (byte[], bool) BuildSetupResponse(RtspRequest request, PairingAccessorySession pairing, FairPlaySetupSession fairplay, MirrorSetupState mirror, IPAddress remoteAddr)
     {
         PlistValue? req = request.Body.Length > 0 ? BinaryPlist.Decode(request.Body) : null;
         if (req is null) return (BuildStatusResponse(request, 400, "Bad Request"), true);
@@ -246,55 +192,33 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
             mirror.SessionAesKey = sessionKey;
             Trace($"  chiave di sessione decifrata: {Convert.ToHexString(sessionKey)}");
 
-            // A real receiver always returns a genuine bound port here — no
-            // NTP responder behind it yet (that's still to build), but an
-            // open, real port costs nothing and tests the hypothesis that a
-            // client reading timingPort=0 gives up before ever asking for
-            // the actual mirroring stream.
             mirror.TimingSocket = new UdpClient(0);
             int timingPort = ((IPEndPoint)mirror.TimingSocket.Client.LocalEndPoint!).Port;
             res.Add("timingPort", (long)timingPort);
 
-            // Experiment: UxPlay's own comment says eventPort is unused for
-            // mirroring, and every prior variant tried here (real
-            // timingPort, proactive streams) made zero observable
-            // difference to this client's behavior — it always goes
-            // RECORD -> TEARDOWN without ever touching the offered data
-            // port. Testing whether a real, connectable eventPort changes
-            // that, since it's the one thing not yet tried.
-            mirror.EventListener = new TcpListener(IPAddress.Any, 0);
-            mirror.EventListener.Start();
-            int eventPort = ((IPEndPoint)mirror.EventListener.LocalEndpoint).Port;
-            (byte[] WriteKey, byte[] ReadKey)? eventKeys = pairing.EventChannelKeys;
-            if (eventKeys is { } k) StartEventListener(mirror.EventListener, k.WriteKey, k.ReadKey);
-            else Trace("  niente segreto ECDH disponibile — canale eventi aperto ma non cifrato");
-            res.Add("eventPort", (long)eventPort);
+            // eventPort: UxPlay's own source returns the literal constant 0
+            // here ("the event port is not used in mirror mode or audio
+            // mode") — no real listener. A real, HAP-encrypted eventPort was
+            // tried in an earlier session: the client did connect to it, but
+            // still went RECORD -> TEARDOWN, so it wasn't the fix — reverted
+            // to match the verified reference exactly.
+            res.Add("eventPort", 0L);
 
-            // This device's SETUP never carries a "streams" array or a
-            // streamConnectionID at all (confirmed — logged every key that
-            // arrived) — a shape UxPlay's own source doesn't handle either.
-            // Speculative experiment: some newer client might expect the
-            // receiver to just proactively offer the mirroring data port in
-            // this same reply instead of waiting to be asked. No real
-            // streamConnectionID exists to derive the video key from, so
-            // this uses 0 — only meaningful as a test of whether the client
-            // proceeds any further at all, not expected to make the actual
-            // video decrypt correctly (see the real per-stream derivation
-            // path below, still used when a client *does* send streams).
-            bool isMirroring = req.Find("isScreenMirroringSession")?.BoolValue ?? false;
-            if (isMirroring)
+            // The client's own timingPort (where IT expects OUR clock-sync
+            // requests, not the other way around — see NtpTimingSession's
+            // doc comment) only appears on this same ekey/eiv-bearing SETUP.
+            long? clientTimingPort = req.Find("timingPort")?.AsInt();
+            if (clientTimingPort is { } ctp and > 0)
             {
-                Trace("  nessun array streams nella richiesta — provo a offrire la porta dati proattivamente (streamConnectionID=0)");
-                (byte[] videoKey, byte[] videoIv) = MirroringDataReceiver.DeriveVideoKeyIv(sessionKey, 0);
-                var receiver = new MirroringDataReceiver();
-                receiver.SetVideoKeyIv(videoKey, videoIv);
-                receiver.Diagnostics += msg => Trace($"  [dati mirroring] {msg}");
-                receiver.Start();
-                mirror.DataReceiver = receiver;
-                Trace($"  in ascolto proattivamente su porta dati {receiver.LocalPort}");
-                res.Add("streams", PlistValue.Array([
-                    new PlistDictBuilder().Add("dataPort", (long)receiver.LocalPort).Add("type", 110L).Build(),
-                ]));
+                var remote = new IPEndPoint(remoteAddr, (int)ctp);
+                var timing = new NtpTimingSession(mirror.TimingSocket, remote);
+                timing.Diagnostics += msg => Trace($"  [timing] {msg}");
+                timing.Start();
+                mirror.Timing = timing;
+            }
+            else
+            {
+                Trace("  il client non ha inviato un proprio timingPort — nessuno scambio timing da avviare");
             }
         }
 
