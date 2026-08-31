@@ -8,12 +8,13 @@ AirPlay nativo per Windows, nei due versi:
 - **Ricevitore di mirroring** (Fase 2, in corso — vedi sotto): fa comparire
   questo PC come bersaglio "Duplica schermo" nel Centro di Controllo di un
   iPhone, restando raggiungibile anche in background (icona nel tray, avvio
-  automatico con Windows). Pairing, cifratura, **e il video vero**
-  funzionano fino in fondo — un iPhone reale ha trasmesso un flusso H.264
-  vero, decifrato correttamente byte per byte, per quasi 2000 pacchetti
-  consecutivi. La pipeline di rendering (`MirrorWindow`, dimensioni native
-  lette dalla SPS) è costruita e compila pulita; manca ancora l'ultimo
-  passo — verificarla dal vivo contro un mirroring reale.
+  automatico con Windows, chiusura sincronizzata in entrambe le direzioni
+  con il telefono). Pairing, cifratura e decrittazione funzionano fino in
+  fondo, verificati dal vivo ripetutamente. **Il pezzo che manca**: il
+  video si vede a schermo (a volte nitido, a volte no) ma si blocca dopo
+  pochi secondi — un bug isolato interamente nell'ultimissimo miglio del
+  rendering (vedi "La caccia al bug del rendering"), non nella cattura o
+  nella decifratura, che restano solide.
 
 Apple non pubblica API per nessuno dei due versi su piattaforme non Apple.
 Questo progetto ricostruisce i protocolli (pairing HAP, RTSP cifrato,
@@ -408,12 +409,159 @@ un mirroring vero.
   l'app non pacchettizzata) con l'argomento `--minimized`, riscritta a ogni
   avvio così si autoripara se l'eseguibile cambia percorso.
 
-**Verificato finora**: l'intero progetto App (incluso `MirrorWindow`) compila
-senza errori né warning, la suite di test di `AirPlaySender.Core` passa
-tutta (52/52). **Non ancora verificato**: che `MirrorWindow` mostri
-davvero un fotogramma vero a schermo durante un mirroring reale — l'unico
-pezzo di questa parte di lavoro mai ancora messo alla prova contro
-l'hardware, in attesa di un test dal vivo col telefono.
+**Verificato quella notte**: l'intero progetto App (incluso `MirrorWindow`)
+compila senza errori né warning, la suite di test di `AirPlaySender.Core`
+passa tutta (52/52). **Non ancora verificato**: che `MirrorWindow` mostri
+davvero un fotogramma vero a schermo durante un mirroring reale — quel
+test dal vivo è la sessione raccontata nella sezione seguente.
+
+## 🐛 La caccia al bug del rendering (notte successiva)
+
+Primo test dal vivo di `MirrorWindow` contro un mirroring reale. Trovati e
+corretti **due bug veri** lungo la strada, poi una terza cosa — quella per
+cui il video si vede ma si blocca dopo pochi secondi — che a fine sessione
+resta **non risolta**, con tutto quello che è stato escluso documentato qui
+sotto perché non vada rifatto da capo.
+
+### Bug #1 — la chiave video, per un ID negativo
+
+Il primo test: la finestra si apre ma resta tutta nera. Il log (mai
+collegato a nessun output prima di quella notte — vedi `AppLog.cs`, un
+logger su file perché l'app in background non ha più una console)
+mostra l'SPS/PPS decodificato correttamente, ma **zero** pacchetti video
+mai trasformati in un NAL valido, anche se la decifratura non solleva mai
+un errore — sintomo classico di una chiave sbagliata: AES-CTR "riesce"
+sempre, produce solo spazzatura.
+
+`MirroringDataReceiver.DeriveVideoKeyIv` deriva la chiave video formattando
+`streamConnectionID` dentro una stringa (`"AirPlayStreamKey{id}"`) prima di
+farne lo SHA-512. Controllato il vero sorgente di UxPlay
+(`mirror_buffer_init_aes`, `lib/mirror_buffer.c`): usa `PRIu64` — **senza
+segno**. Il campo del plist però decodifica come `long` con segno in C#
+(l'encoding a 8 byte di bplist), e per un ID il cui bit più alto è
+impostato usciva **negativo** in C# — stringa tipo
+`"AirPlayStreamKey-292324589914665516"` invece di quella vera
+(`"...18154419483794886100"`, la stessa sequenza di bit letta come
+`ulong`). La sessione precedente ("il video vero funziona") aveva avuto la
+fortuna di un ID positivo — stessa stringa in entrambi i casi, bug mai
+esercitato. Corretto reinterpretando come `ulong` prima di formattare, con
+test di regressione sull'ID reale negativo visto quella notte.
+
+### Bug #2 — la finestra e il telefono non si sincronizzavano alla chiusura
+
+Fermare il mirroring da iPhone non chiudeva la finestra su Windows (e
+viceversa). Aggiunto `MirroringDataReceiver.SessionEnded` (scatta nel
+`finally` di `AcceptLoopAsync`, qualunque sia la causa della fine) perché
+`MirrorWindow` si chiuda da sola quando il telefono ferma il mirroring, e
+`CloseSessionRequested` (con `RequestSessionClose()`) perché chiudere la
+finestra chiuda anche la connessione RTSP — così il telefono se ne accorge
+e si ferma anche lui, invece di continuare a credere di stare ancora
+facendo mirroring nel vuoto. Il collegamento vive nel setter di
+`MirrorSetupState.DataReceiver` dentro `AirPlayReceiverServer`, l'unico
+punto con accesso sia al receiver sia al `TcpClient` della connessione RTSP
+che lo possiede — `BuildSetupResponse`, dove i receiver nascono, non ha un
+proprio riferimento a quel `client`.
+
+**Un bug vero, introdotto e corretto nello stesso giro**: ogni sessione di
+mirroring crea *due* `MirroringDataReceiver` (uno dall'offerta proattiva
+`ekey`/`eiv`, uno dalla vera `SETUP` con `streams[]` che arriva quasi
+subito e sostituisce il primo, mai davvero connesso). La chiusura
+automatica di quello "fantasma" chiamava comunque `CloseSessionRequested`
+— chiudendo la connessione RTSP **condivisa** e facendo cadere anche la
+sessione vera appena nata: connessione, poi disconnessione immediata,
+senza preavviso. Distinto con `MirrorWindow.ShouldRequestSessionClose`
+(`true` solo per una chiusura iniziata davvero dall'utente, non per
+`SessionEnded`).
+
+### Il bug che resta: video che si blocca dopo pochi secondi
+
+Con SPS/PPS e video che arrivano decifrati bene, il rendering **a volte
+esce pulito** (l'home screen dell'iPhone, nitida, verificata con uno
+screenshot vero di Windows — non una foto col telefono, che introduce i
+suoi artefatti fuorvianti) e **a volte esce corrotto** (sbavature
+cromatiche sui bordi, come se i canali colore fossero disallineati) — ma
+**si blocca sempre**, dopo circa 1-3 secondi, e non si riprende più, anche
+se il telefono continua a mandare dati.
+
+Ogni pista seguita, verificata e **esclusa** (nessuna ha cambiato il
+comportamento):
+- **Ordine dei campioni**: `OnSampleRequested` lanciava un `Task` per
+  richiesta, che con letture concorrenti potevano completarsi fuori
+  ordine — serializzato con un `SemaphoreSlim(1,1)`.
+- **Timestamp duplicati**: `DateTime.UtcNow` ha risoluzione reale di
+  circa 15ms, non il millisecondo che stampa — più campioni consecutivi
+  (SPS/PPS + i primi NAL, arrivati quasi insieme) finivano sullo stesso
+  timestamp. Resi strettamente crescenti.
+- **`Duration` mai impostata**, poi impostata a un valore fisso (~30fps),
+  poi corretta al tempo vero trascorso dal campione precedente — un
+  valore fisso con arrivi a raffica dalla rete fa sembrare "bufferizzato"
+  molto più di quanto sia realmente passato in tempo reale.
+- **`_streamStart`** risincronizzato all'avvio vero della pipeline
+  invece che alla costruzione della finestra (poteva essere già
+  qualche centinaio di ms nel passato per via dell'attesa di SPS/PPS).
+- **Dimensione finestra vs. area video**: `AppWindow.Resize` imposta la
+  finestra *esterna* (bordi/barra del titolo inclusi), non l'area client
+  dove il video renderizza — ~16×39px di differenza misurati dal vivo.
+  Corretto con un resize in due passaggi (misura, poi compensa).
+- **`MediaPlayer`/`MediaStreamSource` mai rilasciati** (`Dispose`) alla
+  chiusura di una finestra — attraverso una dozzina di tentativi nello
+  stesso processo, plausibile causa di risorse GPU accumulate. Corretto,
+  nessun cambiamento osservato.
+- **`CanSeek`/`RealTimePlayback`**: entrambi documentati esplicitamente
+  da Microsoft per lo streaming live via `MediaStreamSource` (un vero
+  Q&A ufficiale), aggiunti, nessun cambiamento.
+- **RTX Video Enhancement** (Super Resolution/HDR di NVIDIA): già
+  disattivati dall'utente prima ancora di controllare.
+- **Focus della finestra**: la teoria più promettente — Windows può
+  sospendere il rendering di finestre non a fuoco per risparmio
+  energetico — testata **tenendo la finestra a fuoco per tutto il
+  tempo**: si blocca comunque.
+- **Formato AVCC + `SetFormatUserData`** invece di Annex-B (il formato
+  usato da praticamente ogni MP4 su Windows, quindi il percorso più
+  battuto del decoder H.264 di Media Foundation): peggio, non meglio —
+  `MediaOpened` smetteva del tutto di scattare. Confermato che
+  `VideoEncodingProperties.CreateH264()` è legato all'Annex-B a
+  prescindere da dove arrivano SPS/PPS. Ripristinato.
+- **Cifratura AES-CTR**: sospettata per ultima, perché tutti i test
+  esistenti verificavano solo coerenza interna (round-trip, spezzare vs.
+  blocco unico) — proprietà che un keystream sistematicamente sbagliato
+  soddisferebbe comunque, dato che applicare la stessa sequenza sbagliata
+  due volte si annulla da sé. Scritto un test indipendente da zero
+  (contatore `BigInteger`, non il loop a byte con riporto sotto test) su
+  90.000 byte — la taglia di un vero IDR — **verificata corretta anche su
+  larga scala**.
+
+**Conclusione onesta**: il flusso dati è verificato sano al 100% —
+campioni consegnati in ordine, temporizzati bene, dimensioni corrette,
+`MediaPlayer` non solleva mai un errore (`MediaFailed` non scatta
+nemmeno una volta in tutta la sessione). Il blocco succede dentro
+l'engine di rendering di Windows/Media Foundation, in un punto
+completamente opaco da questa API — nessun log possibile da lì. `MediaPlayerElement`
+inoltre non compone il video nel normale albero XAML: usa uno swap
+chain separato che Windows disegna "sotto" l'interfaccia attraverso un
+buco ritagliato — un dettaglio architetturale scoperto tardi, non ancora
+sfruttato per una diagnosi più profonda.
+
+**Prossimo passo onesto, non tentato quella notte**: il *frame-server
+mode* di WinRT (`MediaPlayer.IsVideoFrameServerEnabled` +
+`VideoFrameAvailable` + `CopyFrameToVideoSurface`) — invece di lasciare
+che WinRT componga automaticamente il video, prendere i fotogrammi già
+decodificati **dall'hardware** (nessuna perdita di accelerazione) e
+disegnarli a mano tramite Win2D. Richiede una libreria in più
+(`Microsoft.Graphics.Win2D`) e una riscrittura della parte finale della
+pipeline — non un tweak leggero, e Microsoft stessa segnala su GitHub
+che questa modalità "ha dei bug propri e non può sostituire
+`MediaPlayerElement` in pieno" (issue mai risolta su
+`MixedReality-WebRTC`, un altro progetto Microsoft che ha usato lo
+stesso approccio `MediaStreamSource` e ha lasciato un identico bug di
+freeze irrisolto quando il repository è stato archiviato). Da provare con
+occhi freschi, non a fine di una sessione già lunga.
+
+Tutto il resto costruito quella notte — le due correzioni sopra, il
+logger su file, i test AES-CTR indipendenti — è verificato e solido, non
+buttato via: il blocco è isolato all'ultimissimo miglio (il pixel a
+schermo), non alla cattura/decifratura/instradamento del video, che
+restano la parte difficile e già risolta di questo progetto.
 
 ## Architettura
 
@@ -446,6 +594,8 @@ src/
                            icona nel tray, MirrorWindow per il rendering del mirroring)
     MirrorWindow.xaml(.cs)   finestra di rendering: MediaStreamSource H.264, dimensioni native
     StartupRegistration.cs   voce nella chiave Run di HKCU per l'avvio con Windows
+    AppLog.cs                logger su file (mirroring.log accanto all'exe) — l'unico
+                              modo di vedere i log in un'app senza console/in background
 
 tests/
   AirPlaySender.Core.Tests/
@@ -571,14 +721,18 @@ verificati empiricamente in questo progetto:
 - **Fase 2 (ricevitore di mirroring)**: video vero ricevuto e decifrato con
   successo su hardware reale (quasi 2000 pacchetti, AVCC, verificato byte
   per byte — vedi "Il video vero funziona"); pipeline di rendering
-  (`MirrorWindow`, `MediaStreamSource`), icona nel tray, chiusura che
-  nasconde invece di terminare, e avvio automatico con Windows tutti
-  costruiti e verificati a compilazione — vedi "Il rendering, il
-  funzionamento in background e l'avvio con Windows". Resta:
-  1. **Il test dal vivo di `MirrorWindow` contro un mirroring reale** — mai
-     ancora messo alla prova che un fotogramma vero arrivi davvero a schermo,
-     l'unico pezzo di tutta questa fase non ancora verificato contro
-     l'hardware.
+  (`MirrorWindow`, `MediaStreamSource`), icona nel tray, chiusura
+  sincronizzata in entrambe le direzioni fra Windows e iPhone, e avvio
+  automatico con Windows tutti costruiti e testati dal vivo — vedi "La
+  caccia al bug del rendering". Resta:
+  1. **Il video si vede ma si blocca dopo pochi secondi** — il pezzo grosso
+     che manca ora. Flusso dati verificato sano al 100% (vedi sopra per
+     tutto quello già escluso); il blocco è dentro l'engine di rendering
+     di Windows, opaco da questa API. Prossimo tentativo concreto, non
+     ancora provato: il *frame-server mode* di WinRT
+     (`IsVideoFrameServerEnabled` + Win2D) per prendere i fotogrammi già
+     decodificati dall'hardware e disegnarli a mano, bypassando qualunque
+     cosa si rompa nella composizione automatica di `MediaPlayerElement`.
   2. Il pair-setup HAP "vero" (transient collegato ma probabilmente non la
      forma corretta — vedi sopra) resta un'incognita a bassa priorità ora:
      il percorso legacy già collegato funziona fino al video vero, quindi
