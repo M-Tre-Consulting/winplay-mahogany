@@ -60,28 +60,50 @@ public partial class App : Application
             _advertiser.Start();
 
             _receiverServer = new AirPlayReceiverServer(MirroringPort, identity, deviceId);
+            // Forwards every RTSP-dispatch trace AND (already re-forwarded from
+            // inside AirPlayReceiverServer's own SETUP handlers) every
+            // MirroringDataReceiver.Diagnostics — the one place to see what a
+            // live session actually did, now that this runs as a background
+            // app with no attached console.
+            _receiverServer.Diagnostics += AppLog.Write;
             _receiverServer.MirroringSessionStarted += OnMirroringSessionStarted;
             _receiverServer.Start();
+            AppLog.Write($"Ricevitore di mirroring avviato sulla porta {MirroringPort}");
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"Ricevitore di mirroring non avviato: {ex.Message}");
+            AppLog.Write($"Ricevitore di mirroring non avviato: {ex}");
         }
     }
 
     /// <summary>Opens a new render window for each mirroring session — called on <see cref="AirPlayReceiverServer"/>'s own background accept loop, so hop back to the UI thread before touching any window.</summary>
     private void OnMirroringSessionStarted(MirroringDataReceiver receiver)
     {
+        AppLog.Write("MirroringSessionStarted: apro una MirrorWindow");
         _window?.DispatcherQueue.TryEnqueue(() =>
         {
-            var mirrorWindow = new MirrorWindow();
-            mirrorWindow.Attach(receiver);
-            lock (_mirrorWindows) _mirrorWindows.Add(mirrorWindow);
-            mirrorWindow.Closed += (_, _) =>
+            try
             {
-                mirrorWindow.Detach(receiver);
-                lock (_mirrorWindows) _mirrorWindows.Remove(mirrorWindow);
-            };
+                var mirrorWindow = new MirrorWindow();
+                mirrorWindow.Attach(receiver);
+                lock (_mirrorWindows) _mirrorWindows.Add(mirrorWindow);
+                mirrorWindow.Closed += (_, _) =>
+                {
+                    mirrorWindow.Detach(receiver);
+                    lock (_mirrorWindows) _mirrorWindows.Remove(mirrorWindow);
+                    // Only for a real, user-initiated close (the X button) — NOT when this
+                    // window auto-closed because its own SessionEnded already fired. Getting
+                    // this backwards took the real session down as collateral damage of the
+                    // proactive-offer receiver's own routine cleanup (see MirrorWindow's doc
+                    // comment on ShouldRequestSessionClose) — confirmed live, fixed here.
+                    if (mirrorWindow.ShouldRequestSessionClose) receiver.RequestSessionClose();
+                };
+                AppLog.Write("MirrorWindow creata e agganciata");
+            }
+            catch (Exception ex)
+            {
+                AppLog.Write($"Creazione di MirrorWindow fallita: {ex}");
+            }
         });
     }
 }

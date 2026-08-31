@@ -49,6 +49,37 @@ public static class AvcDecoderConfig
     }
 
     /// <summary>
+    /// Rebuilds a minimal, valid AVCDecoderConfigurationRecord from a parsed SPS/PPS pair —
+    /// the exact inverse of <see cref="TryParse"/>. For handing to a consumer that wants the
+    /// record as codec private/"format user" data (e.g. WinRT's
+    /// <c>VideoEncodingProperties.SetFormatUserData</c>) instead of the Annex-B in-band-
+    /// parameter-set convention.
+    /// </summary>
+    public static byte[] BuildRecord(ReadOnlySpan<byte> sps, ReadOnlySpan<byte> pps)
+    {
+        // sps[1..3] are the SPS's own profile_idc / constraint flags / level_idc bytes —
+        // the AVCDecoderConfigurationRecord's AVCProfileIndication/profile_compatibility/
+        // AVCLevelIndication fields are literally copies of these (ISO/IEC 14496-15).
+        var record = new List<byte>(11 + sps.Length + pps.Length)
+        {
+            1, // configurationVersion
+            sps.Length > 1 ? sps[1] : (byte)0, // AVCProfileIndication
+            sps.Length > 2 ? sps[2] : (byte)0, // profile_compatibility
+            sps.Length > 3 ? sps[3] : (byte)0, // AVCLevelIndication
+            0xFF, // 6 reserved bits (111111) + lengthSizeMinusOne=3 -> 4-byte length prefixes
+            0xE1, // 3 reserved bits (111) + numOfSequenceParameterSets=1
+        };
+        record.Add((byte)(sps.Length >> 8));
+        record.Add((byte)sps.Length);
+        record.AddRange(sps.ToArray());
+        record.Add(1); // numOfPictureParameterSets
+        record.Add((byte)(pps.Length >> 8));
+        record.Add((byte)pps.Length);
+        record.AddRange(pps.ToArray());
+        return [.. record];
+    }
+
+    /// <summary>
     /// Splits a decrypted mirroring VCL payload into its individual AVCC
     /// (4-byte big-endian length prefix, per-NAL) units — usually just one
     /// per packet in practice, but this loops in case a real device ever

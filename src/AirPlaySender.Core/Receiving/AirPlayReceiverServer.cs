@@ -68,7 +68,7 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
         var pairing = new PairingAccessorySession(_identity);
         var hapPairSetup = new HapPairSetupAccessorySession();
         var fairplay = new FairPlaySetupSession();
-        var mirror = new MirrorSetupState();
+        var mirror = new MirrorSetupState(client);
         try
         {
             client.NoDelay = true;
@@ -112,13 +112,33 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
         }
     }
 
-    /// <summary>Per-connection state that only SETUP fills in: the FairPlay-decrypted session AES key, the mirror data listener, and the timing exchange.</summary>
-    private sealed class MirrorSetupState
+    /// <summary>
+    /// Per-connection state that only SETUP fills in: the FairPlay-decrypted session AES
+    /// key, the mirror data listener, and the timing exchange. Takes the owning RTSP
+    /// connection's <see cref="TcpClient"/> so <see cref="DataReceiver"/>'s setter can wire
+    /// each new <see cref="MirroringDataReceiver.CloseSessionRequested"/> to it —
+    /// <see cref="BuildSetupResponse"/> (where receivers get created) has no <c>client</c> of
+    /// its own, only this state object, so the wiring has to live here.
+    /// </summary>
+    private sealed class MirrorSetupState(TcpClient client)
     {
         public byte[]? SessionAesKey { get; set; }
-        public MirroringDataReceiver? DataReceiver { get; set; }
         public UdpClient? TimingSocket { get; set; }
         public NtpTimingSession? Timing { get; set; }
+
+        private MirroringDataReceiver? _dataReceiver;
+        public MirroringDataReceiver? DataReceiver
+        {
+            get => _dataReceiver;
+            set
+            {
+                _dataReceiver = value;
+                // Closing our render window (or the session ending on its own) closes the RTSP
+                // control connection too, so the phone notices and stops mirroring instead of
+                // going on thinking it still is.
+                if (value is not null) value.CloseSessionRequested += () => { try { client.Close(); } catch { } };
+            }
+        }
     }
 
     private (byte[] Bytes, bool CloseAfter) BuildResponse(RtspRequest request, PairingAccessorySession pairing, HapPairSetupAccessorySession hapPairSetup, FairPlaySetupSession fairplay, MirrorSetupState mirror, IPAddress remoteAddr)
@@ -275,7 +295,7 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
                 receiver.SetVideoKeyIv(videoKey, videoIv);
                 receiver.Diagnostics += msg => Trace($"  [dati mirroring] {msg}");
                 receiver.Start();
-                mirror.DataReceiver = receiver;
+                mirror.DataReceiver = receiver; // wires CloseSessionRequested too — see MirrorSetupState
                 MirroringSessionStarted?.Invoke(receiver);
                 Trace($"  in ascolto su porta dati {receiver.LocalPort}");
                 res.Add("streams", PlistValue.Array([
@@ -313,7 +333,7 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
                     receiver.SetVideoKeyIv(videoKey, videoIv);
                     receiver.Diagnostics += msg => Trace($"  [dati mirroring] {msg}");
                     receiver.Start();
-                    mirror.DataReceiver = receiver;
+                    mirror.DataReceiver = receiver; // wires CloseSessionRequested too — see MirrorSetupState
                     MirroringSessionStarted?.Invoke(receiver);
                     Trace($"  stream mirroring: streamConnectionID={streamConnectionId}, in ascolto su porta dati {receiver.LocalPort}");
 

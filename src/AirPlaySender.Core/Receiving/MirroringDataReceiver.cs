@@ -34,6 +34,21 @@ public sealed class MirroringDataReceiver : IAsyncDisposable
     /// <summary>Fires once per decrypted VCL NAL unit (Annex-B-style bytes NOT included — raw NAL, header byte first), in wire order. Args: (nal, isIdr).</summary>
     public event Action<byte[], bool>? NalReceived;
 
+    /// <summary>Fires once when this session's data connection ends, for any reason (peer closed, error, cancellation) — the signal a renderer uses to close its own window instead of sitting there showing a frozen last frame forever.</summary>
+    public event Action? SessionEnded;
+
+    /// <summary>
+    /// Raised by <see cref="RequestSessionClose"/> — a renderer (MirrorWindow) calls that
+    /// when the USER closes its window, so <see cref="AirPlayReceiverServer"/> can close the
+    /// owning RTSP control connection too. Without this, closing our render window left the
+    /// phone still thinking it was mirroring (its data just went nowhere) instead of it
+    /// noticing the receiver went away and stopping, matching normal AirPlay behavior.
+    /// </summary>
+    public event Action? CloseSessionRequested;
+
+    /// <summary>Call when the user closes the window showing this session — see <see cref="CloseSessionRequested"/>.</summary>
+    public void RequestSessionClose() => CloseSessionRequested?.Invoke();
+
     public int LocalPort { get; }
 
     public MirroringDataReceiver()
@@ -56,13 +71,35 @@ public sealed class MirroringDataReceiver : IAsyncDisposable
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
         catch (Exception ex) { Trace($"Errore sul canale dati mirroring: {ex.Message}"); }
+        finally
+        {
+            // Temporary: a live session had this fire for one MirroringDataReceiver of a
+            // pair but not the other, with no obvious code-level reason — logging whether
+            // this actually runs and how many SessionEnded subscribers exist at that point,
+            // to tell "never invoked" apart from "invoked but the subscriber didn't act".
+            Trace($"AcceptLoopAsync termina (iscritti a SessionEnded: {SessionEnded?.GetInvocationList().Length ?? 0})");
+            SessionEnded?.Invoke();
+        }
     }
 
-    /// <summary>Derives the per-stream video AES-CTR key/iv: SHA-512("AirPlayStreamKey{id}" or "...IV{id}" || sessionAesKey)[0..16].</summary>
+    /// <summary>
+    /// Derives the per-stream video AES-CTR key/iv: SHA-512("AirPlayStreamKey{id}" or
+    /// "...IV{id}" || sessionAesKey)[0..16]. Confirmed against UxPlay's real
+    /// <c>mirror_buffer_init_aes</c> (lib/mirror_buffer.c): it formats the id with
+    /// <c>PRIu64</c> — unsigned. The plist's <c>streamConnectionID</c> field decodes as a
+    /// signed 64-bit <see cref="long"/> here (bplist's 8-byte integer encoding), so an id
+    /// whose top bit is set comes out negative in C# but must still be formatted as its
+    /// unsigned 64-bit decimal string to match the real device's hash input — reinterpret,
+    /// don't just print the signed value. Never exercised against a real negative id until
+    /// a live session got one and decrypted every video packet to garbage while the
+    /// unencrypted SPS/PPS packet (this derivation doesn't touch it) decoded fine, which is
+    /// what gave it away.
+    /// </summary>
     public static (byte[] Key, byte[] Iv) DeriveVideoKeyIv(byte[] sessionAesKey, long streamConnectionId)
     {
-        byte[] key = Sha.Sha512([.. Encoding.ASCII.GetBytes($"AirPlayStreamKey{streamConnectionId}"), .. sessionAesKey])[..16];
-        byte[] iv = Sha.Sha512([.. Encoding.ASCII.GetBytes($"AirPlayStreamIV{streamConnectionId}"), .. sessionAesKey])[..16];
+        ulong unsignedId = unchecked((ulong)streamConnectionId);
+        byte[] key = Sha.Sha512([.. Encoding.ASCII.GetBytes($"AirPlayStreamKey{unsignedId}"), .. sessionAesKey])[..16];
+        byte[] iv = Sha.Sha512([.. Encoding.ASCII.GetBytes($"AirPlayStreamIV{unsignedId}"), .. sessionAesKey])[..16];
         return (key, iv);
     }
 
