@@ -41,6 +41,28 @@ public sealed class MirrorAudioReceiver : IAsyncDisposable
     /// <summary>Fires once when the audio receiver stops (peer gone, error, cancellation).</summary>
     public event Action? SessionEnded;
 
+    /// <summary>Fires whenever the client changes the AirPlay volume — carries a linear playback gain in [0, 1] (0 = muted, 1 = full).</summary>
+    public event Action<double>? VolumeGainChanged;
+
+    /// <summary>Current linear gain from the last AirPlay volume the client sent — 1.0 until it says otherwise.</summary>
+    public double VolumeGain { get; private set; } = 1.0;
+
+    /// <summary>
+    /// Applies an AirPlay volume value (dB-ish: 0.0 = loudest, about -30.0 = quietest,
+    /// -144.0 = muted) as a linear gain, matching UxPlay's <c>raop_set_volume</c>
+    /// (<c>10^(volume/20)</c>). Volume comes over RTSP as <c>SET_PARAMETER</c>
+    /// <c>text/parameters</c> "volume: &lt;float&gt;" — see <see cref="AirPlayReceiverServer"/>.
+    /// </summary>
+    public void SetAirplayVolume(float airplayVolumeDb)
+    {
+        double gain = airplayVolumeDb <= -144f ? 0.0
+                    : airplayVolumeDb >= 0f ? 1.0
+                    : Math.Pow(10.0, airplayVolumeDb / 20.0);
+        VolumeGain = gain;
+        Trace($"volume: {airplayVolumeDb:F2} dB -> gain {gain:F4}");
+        VolumeGainChanged?.Invoke(gain);
+    }
+
     public MirrorAudioReceiver(byte[] key16, byte[] iv16)
     {
         _aes = Aes.Create();

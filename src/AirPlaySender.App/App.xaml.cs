@@ -165,11 +165,15 @@ public partial class App : Application
 
                 AacEldDecoder d = decoder;
                 MirrorAudioPlayer p = player;
+                void OnVolume(double gain) { try { p.SetGain(gain); } catch { } }
                 receiver.AudioFrameReceived += OnFrame;
+                receiver.VolumeGainChanged += OnVolume;
+                p.SetGain(receiver.VolumeGain); // whatever the client already set
                 receiver.SessionEnded += () =>
                 {
                     AppLog.Write("MirrorAudioReceiver: sessione audio terminata");
                     receiver.AudioFrameReceived -= OnFrame;
+                    receiver.VolumeGainChanged -= OnVolume;
                     _ = p.DisposeAsync();
                     d.Dispose();
                 };

@@ -131,6 +131,7 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
         public UdpClient? TimingSocket { get; set; }
         public NtpTimingSession? Timing { get; set; }
         public MirrorAudioReceiver? AudioReceiver { get; set; }
+        public float CurrentVolume { get; set; }       // AirPlay dB scale, 0.0 = loudest; kept so GET_PARAMETER can echo it and a late-arriving audio stream can pick it up
 
         private MirroringDataReceiver? _dataReceiver;
         public MirroringDataReceiver? DataReceiver
@@ -157,12 +158,13 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
             ("POST", "/pair-verify") => BuildPairVerifyResponse(request, pairing),
             ("POST", "/fp-setup") => BuildFpSetupResponse(request, fairplay),
             ("SETUP", _) => BuildSetupResponse(request, pairing, fairplay, mirror, remoteAddr),
-            ("GET_PARAMETER", _) => (BuildGetParameterResponse(request), false),
+            ("GET_PARAMETER", _) => (BuildGetParameterResponse(request, mirror), false),
+            ("SET_PARAMETER", _) => (BuildSetParameterResponse(request, mirror), false),
             ("RECORD", _) => (BuildRecordResponse(request), false),
             // OPTIONS advertises both of these in its Public header (matching
             // UxPlay), but nothing here answered them — found by code review,
             // they were falling through to 501 instead of 200.
-            ("SET_PARAMETER" or "FLUSH" or "TEARDOWN" or "PAUSE", _) => (BuildStatusResponse(request, 200, "OK"), false),
+            ("FLUSH" or "TEARDOWN" or "PAUSE", _) => (BuildStatusResponse(request, 200, "OK"), false),
             _ => (BuildStatusResponse(request, 501, "Not Implemented"), false),
         };
     }
@@ -389,7 +391,8 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
                     audio.Diagnostics += msg => Trace($"  [audio mirroring] {msg}");
                     audio.Start();
                     mirror.AudioReceiver = audio;
-                    MirrorAudioSessionStarted?.Invoke(audio);
+                    MirrorAudioSessionStarted?.Invoke(audio);   // subscribers wire up first...
+                    audio.SetAirplayVolume(mirror.CurrentVolume); // ...then replay whatever volume already arrived
                     Trace($"  stream audio: in ascolto su dataPort {audio.DataPort} / controlPort {audio.ControlPort}");
 
                     resStreams.Add(new PlistDictBuilder()
@@ -470,17 +473,43 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
         return (BuildOctetStreamResponse(request, body), false);
     }
 
-    /// <summary>The one query a mirroring client is known to poll here: a "volume\r\n" body under Content-Type text/parameters. Shape from UxPlay's raop_handler_get_parameter.</summary>
-    private static byte[] BuildGetParameterResponse(RtspRequest request)
+    /// <summary>The one query a mirroring client is known to poll here: a "volume\r\n" body under Content-Type text/parameters. Shape from UxPlay's raop_handler_get_parameter — answer with the volume the client itself last set, so its slider stays in sync.</summary>
+    private byte[] BuildGetParameterResponse(RtspRequest request, MirrorSetupState mirror)
     {
         if (request.Header("Content-Type") == "text/parameters" && Encoding.ASCII.GetString(request.Body).Contains("volume"))
         {
-            byte[] body = Encoding.ASCII.GetBytes("volume: 0.000000\r\n");
+            byte[] body = Encoding.ASCII.GetBytes($"volume: {mirror.CurrentVolume.ToString("F6", System.Globalization.CultureInfo.InvariantCulture)}\r\n");
             var sb = new StringBuilder();
             AppendStatusLine(sb, request, 200, "OK");
             sb.Append("Content-Type: text/parameters\r\n");
             sb.Append("Content-Length: ").Append(body.Length).Append("\r\n\r\n");
             return [.. Encoding.ASCII.GetBytes(sb.ToString()), .. body];
+        }
+        return BuildStatusResponse(request, 200, "OK");
+    }
+
+    /// <summary>
+    /// The client pushes the AirPlay volume here as it drags the slider: a
+    /// <c>text/parameters</c> body "volume: &lt;float&gt;\r\n" (0.0 = loudest, ~-30.0 =
+    /// quietest, -144.0 = muted). Remember it (for <see cref="BuildGetParameterResponse"/>)
+    /// and hand it to the live audio receiver as a gain.
+    /// </summary>
+    private byte[] BuildSetParameterResponse(RtspRequest request, MirrorSetupState mirror)
+    {
+        if (request.Header("Content-Type") == "text/parameters" && request.Body.Length > 0)
+        {
+            string body = Encoding.ASCII.GetString(request.Body);
+            foreach (string line in body.Split('\n'))
+            {
+                int c = line.IndexOf("volume:", StringComparison.OrdinalIgnoreCase);
+                if (c < 0) continue;
+                if (float.TryParse(line[(c + 7)..].Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float v))
+                {
+                    mirror.CurrentVolume = v;
+                    mirror.AudioReceiver?.SetAirplayVolume(v);
+                    Trace($"  SET_PARAMETER volume = {v}");
+                }
+            }
         }
         return BuildStatusResponse(request, 200, "OK");
     }

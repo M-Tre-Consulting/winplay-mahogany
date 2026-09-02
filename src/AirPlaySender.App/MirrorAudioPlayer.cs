@@ -32,6 +32,7 @@ internal sealed class MirrorAudioPlayer : IAsyncDisposable
     private AudioGraph? _graph;
     private AudioDeviceOutputNode? _output;
     private AudioFrameInputNode? _input;
+    private double _gain = 1.0; // linear, from the iPhone's volume slider
 
     public Action<string>? Diagnostics;
 
@@ -64,10 +65,19 @@ internal sealed class MirrorAudioPlayer : IAsyncDisposable
 
         _input = _graph.CreateFrameInputNode(props);
         _input.AddOutgoingConnection(_output);
+        _input.OutgoingGain = _gain; // apply any volume that arrived before the graph existed
         _input.QuantumStarted += OnQuantumStarted;
 
         _graph.Start();
         Diagnostics?.Invoke($"AudioGraph avviato: {_sampleRate}Hz {_channels}ch, quantum {_graph.SamplesPerQuantum} campioni");
+    }
+
+    /// <summary>Sets the output gain (linear, 0..1) from the iPhone's volume slider.</summary>
+    public void SetGain(double gain)
+    {
+        _gain = gain;
+        AudioFrameInputNode? input = _input;
+        if (input is not null) input.OutgoingGain = gain;
     }
 
     /// <summary>Push one decoded PCM frame (interleaved int16).</summary>

@@ -43,6 +43,24 @@ public class MirrorAudioReceiverTests
         return pkt;
     }
 
+    [Theory]
+    [InlineData(0f, 1.0)]         // loudest
+    [InlineData(-144f, 0.0)]      // muted
+    [InlineData(-200f, 0.0)]      // below the mute floor
+    [InlineData(-20f, 0.1)]       // 10^(-20/20)
+    [InlineData(-6.020599913f, 0.5)]
+    public async Task MapsAirPlayVolumeToLinearGain(float airplayVolumeDb, double expectedGain)
+    {
+        await using var receiver = new MirrorAudioReceiver(Key, Iv);
+        double? seen = null;
+        receiver.VolumeGainChanged += g => seen = g;
+
+        receiver.SetAirplayVolume(airplayVolumeDb);
+
+        Assert.Equal(expectedGain, receiver.VolumeGain, 4);
+        Assert.Equal(expectedGain, seen!.Value, 4);
+    }
+
     [Fact]
     public async Task DecryptsReordersAndDropsRedundantResends()
     {

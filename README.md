@@ -17,11 +17,11 @@ AirPlay nativo per Windows, nei due versi:
   `MediaPlayer` si bloccavano dopo ~1s (bug interno a quello stack di
   Windows, non della cattura/decifratura); lo stadio finale è stato rifatto
   pilotando **il decoder H.264 MFT di Windows direttamente** (`H264Mft.cs`,
-  via `Vortice.MediaFoundation`) + blit su Win2D — vedi "Pipeline di
-  rendering riscritta". L'**audio dal telefono** (stream `type: 96`,
-  AAC-ELD) è stato costruito — ricezione RTP + decifratura AES-CBC, decoder
-  `libfdk-aac`, riproduzione via `AudioGraph` — ma non ancora verificato dal
-  vivo.
+  via `Vortice.MediaFoundation`) + blit su Win2D. E l'**audio dal telefono**
+  (stream `type: 96`, AAC-ELD): ricezione RTP + decifratura AES-CBC, decoder
+  `libfdk-aac`, riproduzione via `AudioGraph`, con il volume che segue lo
+  slider dell'iPhone — verificato dal vivo, audio e video insieme. Vedi
+  "Pipeline di rendering riscritta" e "L'audio dal telefono".
 
 Apple non pubblica API per nessuno dei due versi su piattaforme non Apple.
 Questo progetto ricostruisce i protocolli (pairing HAP, RTSP cifrato,
@@ -835,13 +835,14 @@ fluido**, `in=3098 decoded=3089 shown=3089`, `queued` quasi sempre 0,
 chiusura pulita quando l'utente ferma dal telefono. Immagine nitida, colori
 giusti, 666×1440 a 60fps. Il pezzo grosso della Fase 2 è fatto.
 
-### L'audio dal telefono (implementato, da verificare dal vivo)
+### 🎉 L'audio dal telefono funziona
 
-Lo stesso log mostra l'iPhone che, a mirroring avviato, manda una `SETUP`
-separata con `streams:[{type: 96, ...}]` — lo **stream audio AirPlay** — e
-la ritenta ogni ~2s finché non gli si risponde. Il dump dei campi dello
-stream ha confermato: `ct=8` (**AAC-ELD**), `spf=480`, `sr=44100`, stereo
-(`audioFormat=0x1000000`), `redundantAudio=2`.
+A mirroring avviato l'iPhone manda una `SETUP` separata con
+`streams:[{type: 96, ...}]` — lo **stream audio AirPlay** — e la ritenta
+ogni ~2s finché non gli si risponde. Il dump dei campi ha confermato:
+`ct=8` (**AAC-ELD**), `spf=480`, `sr=44100`, stereo
+(`audioFormat=0x1000000`), `redundantAudio=2`. Costruita la pipeline, e dal
+vivo **si sente tutto**, sincronizzato bene col video.
 
 Windows non ha un decoder AAC-ELD (`CMSAACDecMFT` fa solo LC/HE-AAC), come
 UxPlay che per questo richiede `libfdk-aac`. Costruito:
@@ -860,18 +861,27 @@ UxPlay che per questo richiede `libfdk-aac`. Costruito:
   → PCM int16.
 - **`MirrorAudioPlayer`** (App): `AudioGraph` WinRT + `AudioFrameInputNode`,
   ring buffer con prime a ~50ms, drop-oldest a ~500ms, silenzio sull'underrun.
+  Il primo tentativo non usciva un suono: `MakeFrame` lanciava
+  `InvalidCastException` a ogni quantum — con CsWinRT un oggetto WinRT
+  proiettato non si casta a un'interfaccia `[ComImport]` con un cast C#, ci
+  vuole `reference.As<IMemoryBufferByteAccess>()`.
+- **Volume**: il client manda la posizione dello slider via RTSP
+  `SET_PARAMETER` `text/parameters` "volume: &lt;dB&gt;" (0 = massimo, ~-30
+  = minimo, -144 = muto). `AirPlayReceiverServer` lo parsa,
+  `MirrorAudioReceiver.SetAirplayVolume` lo converte in guadagno lineare
+  (`10^(dB/20)`, come `raop_set_volume` di UxPlay) e `MirrorAudioPlayer` lo
+  applica su `AudioFrameInputNode.OutgoingGain`; `GET_PARAMETER volume`
+  rimanda l'ultimo valore così lo slider resta in sync.
 - `AirPlayReceiverServer` risponde alla `SETUP type 96` con `{dataPort,
   controlPort, type:96}` e alza `MirrorAudioSessionStarted`; `App` collega
   decoder + player.
 
-`et=32` (mai spiegato) è ignorato — sia il video sia UxPlay non lo leggono.
-Se l'audio esce come rumore, il primo sospetto è proprio la modalità/chiave
-di cifratura audio (il log stampa `primo byte decifrato 0xXX`: deve essere
-`0x8c`/`0x8d`/`0x8e`).
+`et=32` (mai spiegato) è ignorato — sia il video sia UxPlay non lo leggono;
+la decifratura CBC produce frame validi (primo byte `0x8c`/`0x8d`/`0x8e`).
 
-**Verificato in locale**: build App pulita (0 warning), **63/63 test**
-(nuovo: `MirrorAudioReceiver` — decifratura CBC + riordino + scarto
-ridondanti su UDP di loopback). **Da verificare dal vivo.**
+**Verificato**: dal vivo audio + video insieme funzionano; in locale build
+pulita, **68/68 test** (`MirrorAudioReceiver`: decifratura CBC, riordino,
+scarto ridondanti, mappatura volume→guadagno).
 
 ## Architettura
 
@@ -1032,26 +1042,19 @@ verificati empiricamente in questo progetto:
 
 - **Fase 1.1**: provare contro più dispositivi reali (Apple TV con PIN,
   altri speaker AirPlay 2), rilevazione disconnessione, multi-room.
-- **Fase 2 (ricevitore di mirroring)**: **il video funziona** 🎉 — ricevuto,
-  decifrato, decodificato (decoder H.264 MFT di Windows pilotato a mano) e
-  reso a schermo (Win2D), 60fps fluidi per oltre un minuto dal vivo contro
-  un iPhone reale. Più icona nel tray, chiusura sincronizzata in entrambe le
-  direzioni, avvio automatico con Windows. Resta:
-  1. **L'audio dal telefono — costruito, da verificare dal vivo.** Lo
-     stream è AAC-ELD (`ct=8`, 480 spf, 44100/2). Costruiti
-     `MirrorAudioReceiver` (UDP RTP + decrypt AES-128-CBC + riordino),
-     `AacEldDecoder` (P/Invoke a `libfdk-aac`, NuGet `fdk-aac`) e
-     `MirrorAudioPlayer` (`AudioGraph`); `AirPlayReceiverServer` risponde
-     alla `SETUP type 96`. Vedi "L'audio dal telefono". Da confermare:
-     modalità/chiave di cifratura audio (`et=32` è ignorato), e la
-     sincronizzazione A/V (per ora l'audio parte con ~50ms di buffer, senza
-     allineamento esplicito ai timestamp del video).
+- **Fase 2 (ricevitore di mirroring)**: **funziona** 🎉 — video (decoder
+  H.264 MFT di Windows pilotato a mano + Win2D, 60fps fluidi) **e audio**
+  (AAC-ELD via `libfdk-aac` + `AudioGraph`, con controllo volume dallo
+  slider dell'iPhone), sincronizzati, verificati dal vivo contro un iPhone
+  reale. Più icona nel tray, chiusura sincronizzata in entrambe le
+  direzioni, avvio automatico con Windows. Rifiniture aperte:
+  1. **Sync A/V fine**: l'audio parte con ~50ms di buffer, senza
+     allineamento esplicito ai timestamp del video — nella pratica va bene,
+     ma non c'è un lip-sync misurato.
   2. Il pair-setup HAP "vero" (transient collegato ma probabilmente non la
      forma corretta — vedi sopra) resta un'incognita a bassa priorità: il
-     percorso legacy già collegato funziona fino in fondo per il video.
-  3. La sessione dati potrebbe aver bisogno di gestire riconnessioni/più
-     stream — il video regge bene una sessione lunga, non ancora provate
-     riconnessioni.
+     percorso legacy già collegato funziona fino in fondo.
+  3. Riconnessioni / più stream nella stessa sessione — non ancora provate.
 - **Fase 2b (sender di mirroring, Windows → TV)**: non affrontata, R&D
   ancora più aperta di quanto sopra — nessun progetto open source esiste per
   questo verso. Vedi la discussione nella cronologia del progetto per la
