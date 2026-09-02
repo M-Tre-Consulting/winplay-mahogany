@@ -3,6 +3,7 @@ using Windows.Media;
 using Windows.Media.Audio;
 using Windows.Media.MediaProperties;
 using Windows.Media.Render;
+using WinRT; // .As<T>() — CsWinRT won't let you plain-cast a projected object to a [ComImport] interface
 
 namespace AirPlaySender.App;
 
@@ -118,7 +119,7 @@ internal sealed class MirrorAudioPlayer : IAsyncDisposable
         using (AudioBuffer buf = frame.LockBuffer(AudioBufferAccessMode.Write))
         using (var reference = buf.CreateReference())
         {
-            ((IMemoryBufferByteAccess)reference).GetBuffer(out byte* dst, out uint cap);
+            reference.As<IMemoryBufferByteAccess>().GetBuffer(out byte* dst, out uint cap);
             fixed (float* src = interleaved)
                 Buffer.MemoryCopy(src, dst, cap, Math.Min(cap, bytes));
         }

@@ -65,7 +65,8 @@ public sealed class MirrorAudioReceiver : IAsyncDisposable
     private async Task ReceiveLoopAsync(CancellationToken ct)
     {
         Trace($"in ascolto audio: dataPort={DataPort} controlPort={ControlPort}");
-        int count = 0;
+        int count = 0, big = 0;
+        int minLen = int.MaxValue, maxLen = 0;
         try
         {
             while (!ct.IsCancellationRequested)
@@ -74,13 +75,21 @@ public sealed class MirrorAudioReceiver : IAsyncDisposable
                 byte[] pkt = r.Buffer;
                 if (pkt.Length < 12 || (pkt[0] & 0xC0) != 0x80) continue; // not RTP v2
 
+                byte pt = (byte)(pkt[1] & 0x7F);
                 ushort seq = (ushort)((pkt[2] << 8) | pkt[3]); // bytes 2-3, big-endian
                 int payloadLen = pkt.Length - 12;
                 if (payloadLen <= 0) continue;
 
                 byte[] frame = Decrypt(pkt, payloadLen);
-                if (++count <= 5)
-                    Trace($"pacchetto audio #{count}: seq={seq}, {payloadLen} byte, primo byte decifrato 0x{frame[0]:X2}");
+                count++;
+                minLen = Math.Min(minLen, payloadLen);
+                maxLen = Math.Max(maxLen, payloadLen);
+                if (count <= 5)
+                    Trace($"pacchetto #{count}: pt={pt} seq={seq}, {payloadLen}B, primi byte decifrati {Hex(frame, 8)} (grezzi {Hex(pkt.AsSpan(12), 8)})");
+                else if (payloadLen > 16 && ++big <= 5)
+                    Trace($"pacchetto 'grande' #{big}: pt={pt} seq={seq}, {payloadLen}B, primi byte decifrati {Hex(frame, 12)} (grezzi {Hex(pkt.AsSpan(12), 12)})");
+                else if (count % 500 == 0)
+                    Trace($"audio: {count} pacchetti, dimensione payload {minLen}..{maxLen}B");
 
                 Reorder(seq, frame);
             }
@@ -163,6 +172,8 @@ public sealed class MirrorAudioReceiver : IAsyncDisposable
         try { AudioFrameReceived?.Invoke(frame); }
         catch (Exception ex) { Trace($"handler audio ha lanciato: {ex.Message}"); }
     }
+
+    private static string Hex(ReadOnlySpan<byte> b, int n) => Convert.ToHexString(b[..Math.Min(n, b.Length)]);
 
     private void Trace(string m) => Diagnostics?.Invoke(m);
 
