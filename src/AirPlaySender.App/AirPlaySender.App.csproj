@@ -58,6 +58,13 @@
          Vortice.MediaFoundation is pure P/Invoke (no extra native binaries). -->
     <PackageReference Include="Microsoft.Graphics.Win2D" Version="1.3.2" />
     <PackageReference Include="Vortice.MediaFoundation" Version="3.6.2" />
+    <!-- Mirroring audio is AAC-ELD (ct=8, 480 spf, 44100/2), which Windows' own
+         AAC decoder can't handle — same reason UxPlay hard-requires libfdk-aac
+         for mirror-mode audio. This package ships prebuilt Fraunhofer FDK AAC
+         (libAACdec.dll) for win-x64/arm64; AacEldDecoder.cs P/Invokes it. NOTE:
+         the FDK AAC codec carries a Fraunhofer license + an AAC patent notice
+         (see the package's NOTICE.txt) — same footing as UxPlay. -->
+    <PackageReference Include="fdk-aac" Version="2.0.3" />
   </ItemGroup>
 
   <ItemGroup>

@@ -18,9 +18,10 @@ AirPlay nativo per Windows, nei due versi:
   Windows, non della cattura/decifratura); lo stadio finale è stato rifatto
   pilotando **il decoder H.264 MFT di Windows direttamente** (`H264Mft.cs`,
   via `Vortice.MediaFoundation`) + blit su Win2D — vedi "Pipeline di
-  rendering riscritta". **Resta da fare l'audio dal telefono**: l'iPhone
-  richiede uno stream audio (`SETUP` con `type: 96`) che il ricevitore non
-  gestisce ancora.
+  rendering riscritta". L'**audio dal telefono** (stream `type: 96`,
+  AAC-ELD) è stato costruito — ricezione RTP + decifratura AES-CBC, decoder
+  `libfdk-aac`, riproduzione via `AudioGraph` — ma non ancora verificato dal
+  vivo.
 
 Apple non pubblica API per nessuno dei due versi su piattaforme non Apple.
 Questo progetto ricostruisce i protocolli (pairing HAP, RTSP cifrato,
@@ -834,22 +835,43 @@ fluido**, `in=3098 decoded=3089 shown=3089`, `queued` quasi sempre 0,
 chiusura pulita quando l'utente ferma dal telefono. Immagine nitida, colori
 giusti, 666×1440 a 60fps. Il pezzo grosso della Fase 2 è fatto.
 
-### Resta: l'audio dal telefono
+### L'audio dal telefono (implementato, da verificare dal vivo)
 
-Lo stesso log mostra l'iPhone che, a mirroring già avviato, manda una
-`SETUP` separata con `streams:[{type: 96, ...}]` — lo **stream audio
-AirPlay** — e la ritenta ogni ~2s perché il ricevitore risponde "SETUP
-stream di tipo 96 non supportato in questa fase". Da fare: rispondere alla
-type 96 (porte UDP `dataPort`/`controlPort`), ricevere l'RTP audio,
-decifrarlo (chiave AES dalla stessa `SessionAesKey` del video + `eiv`),
-decodificare l'AAC e riprodurlo (WASAPI/AudioGraph) sincronizzato col
-video. Nodo aperto: il codec — iOS moderno usa quasi certo **AAC-ELD**, che
-il decoder AAC di Windows (`CMSAACDecMFT`) non gestisce; servirà
-`fdk-aac`/`libavcodec`. Aggiunto un dump completo dei campi di ogni stream
-nella `SETUP` (`stream[type=96] campo: ct = ...`) per vedere `ct`/`spf`/
-`audioFormat`/`shk` esatti al prossimo test.
+Lo stesso log mostra l'iPhone che, a mirroring avviato, manda una `SETUP`
+separata con `streams:[{type: 96, ...}]` — lo **stream audio AirPlay** — e
+la ritenta ogni ~2s finché non gli si risponde. Il dump dei campi dello
+stream ha confermato: `ct=8` (**AAC-ELD**), `spf=480`, `sr=44100`, stereo
+(`audioFormat=0x1000000`), `redundantAudio=2`.
 
-**Verificato in locale**: build App pulita (0 warning), **62/62 test**.
+Windows non ha un decoder AAC-ELD (`CMSAACDecMFT` fa solo LC/HE-AAC), come
+UxPlay che per questo richiede `libfdk-aac`. Costruito:
+
+- **`MirrorAudioReceiver`** (Core): socket UDP dati + controllo, loop RTP.
+  Ogni pacchetto — header RTP 12 byte, seq ai byte 2-3 big-endian — ha il
+  payload cifrato **AES-128-CBC** (chiave = la stessa `SessionAesKey` del
+  video, IV = l'`eiv` di sessione, reset per pacchetto, solo i blocchi
+  interi da 16 byte, coda in chiaro — da `raop_buffer.c` di UxPlay). Riordino
+  per sequence number con scarto dei re-invii ridondanti; emette il frame
+  AAC-ELD grezzo.
+- **`AacEldDecoder`** (App): P/Invoke a `libAACdec.dll` (NuGet `fdk-aac`
+  2.0.3, Fraunhofer FDK AAC prebuilt x64/arm64). AudioSpecificConfig
+  `F8 E8 50 00` (AAC-ELD 44100/2, spf 480) preso verbatim da UxPlay
+  (`audio_renderer.c`, `aac_eld_caps ... codec_data=(buffer)f8e85000`).
+  → PCM int16.
+- **`MirrorAudioPlayer`** (App): `AudioGraph` WinRT + `AudioFrameInputNode`,
+  ring buffer con prime a ~50ms, drop-oldest a ~500ms, silenzio sull'underrun.
+- `AirPlayReceiverServer` risponde alla `SETUP type 96` con `{dataPort,
+  controlPort, type:96}` e alza `MirrorAudioSessionStarted`; `App` collega
+  decoder + player.
+
+`et=32` (mai spiegato) è ignorato — sia il video sia UxPlay non lo leggono.
+Se l'audio esce come rumore, il primo sospetto è proprio la modalità/chiave
+di cifratura audio (il log stampa `primo byte decifrato 0xXX`: deve essere
+`0x8c`/`0x8d`/`0x8e`).
+
+**Verificato in locale**: build App pulita (0 warning), **63/63 test**
+(nuovo: `MirrorAudioReceiver` — decifratura CBC + riordino + scarto
+ridondanti su UDP di loopback). **Da verificare dal vivo.**
 
 ## Architettura
 
@@ -874,6 +896,7 @@ src/
       FairPlayCipher.cs               il cifrario FairPlay vero, portato da UxPlay/OmgHax
       FairPlayCipherTables.g.cs       le sue tabelle S-box, estratte meccanicamente (non a mano)
       MirroringDataReceiver.cs        canale dati video (TCP), framing pacchetti + decrypt, assembla access unit interi (AVCC->Annex-B, SPS/PPS su ogni IDR, timestamp da header offset 8), espone ConfigReceived/FrameReceived
+      MirrorAudioReceiver.cs          canale audio (UDP RTP), decrypt AES-128-CBC per pacchetto + riordino/dedup per seq, espone AudioFrameReceived (frame AAC-ELD grezzi)
       AvcDecoderConfig.cs             AVCDecoderConfigurationRecord + split dei NAL AVCC
       H264Sps.cs                      parser SPS H.264 → larghezza/altezza vere
     AirPlaySession.cs      orchestratore Fase 1: connect → pair → handshake → stream
@@ -882,6 +905,8 @@ src/
                            icona nel tray, MirrorWindow per il rendering del mirroring)
     MirrorWindow.xaml(.cs)   finestra di rendering: coda -> H264Mft -> blit BGRA su CanvasSwapChainPanel (Win2D), dimensioni native
     H264Mft.cs               decoder H.264 MFT di Windows pilotato a mano (ProcessInput/ProcessOutput, low-latency, NV12->BGRA)
+    AacEldDecoder.cs         decoder AAC-ELD via P/Invoke a libAACdec.dll (NuGet fdk-aac) -> PCM int16
+    MirrorAudioPlayer.cs     riproduzione via AudioGraph WinRT (AudioFrameInputNode + ring buffer)
     StartupRegistration.cs   voce nella chiave Run di HKCU per l'avvio con Windows
     AppLog.cs                logger su file (mirroring.log accanto all'exe) — l'unico
                               modo di vedere i log in un'app senza console/in background
@@ -1012,15 +1037,15 @@ verificati empiricamente in questo progetto:
   reso a schermo (Win2D), 60fps fluidi per oltre un minuto dal vivo contro
   un iPhone reale. Più icona nel tray, chiusura sincronizzata in entrambe le
   direzioni, avvio automatico con Windows. Resta:
-  1. **L'audio dal telefono.** L'iPhone manda una `SETUP` separata con
-     `streams:[{type: 96, ...}]` (stream audio AirPlay) e la ritenta ogni
-     ~2s perché il ricevitore la rifiuta. Da fare: rispondere alla type 96
-     (porte UDP dati/controllo), ricevere l'RTP audio, decifrarlo (AES dalla
-     stessa `SessionAesKey` del video + `eiv`), decodificare l'AAC e
-     riprodurlo sincronizzato col video. Probabile **AAC-ELD**, non
-     gestito dal decoder AAC di Windows → servirà `fdk-aac`/`libavcodec`.
-     Un dump dei campi dello stream nella `SETUP` è già loggato per vedere
-     `ct`/`spf`/`audioFormat` esatti.
+  1. **L'audio dal telefono — costruito, da verificare dal vivo.** Lo
+     stream è AAC-ELD (`ct=8`, 480 spf, 44100/2). Costruiti
+     `MirrorAudioReceiver` (UDP RTP + decrypt AES-128-CBC + riordino),
+     `AacEldDecoder` (P/Invoke a `libfdk-aac`, NuGet `fdk-aac`) e
+     `MirrorAudioPlayer` (`AudioGraph`); `AirPlayReceiverServer` risponde
+     alla `SETUP type 96`. Vedi "L'audio dal telefono". Da confermare:
+     modalità/chiave di cifratura audio (`et=32` è ignorato), e la
+     sincronizzazione A/V (per ora l'audio parte con ~50ms di buffer, senza
+     allineamento esplicito ai timestamp del video).
   2. Il pair-setup HAP "vero" (transient collegato ma probabilmente non la
      forma corretta — vedi sopra) resta un'incognita a bassa priorità: il
      percorso legacy già collegato funziona fino in fondo per il video.

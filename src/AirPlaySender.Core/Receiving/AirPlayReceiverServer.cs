@@ -35,6 +35,9 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
     /// <summary>Fires whenever a mirroring data receiver is stood up for a stream (proactive or client-requested) — the hook a UI uses to open a render window and subscribe to that receiver's own <see cref="MirroringDataReceiver.ConfigReceived"/>/<see cref="MirroringDataReceiver.FrameReceived"/>.</summary>
     public event Action<MirroringDataReceiver>? MirroringSessionStarted;
 
+    /// <summary>Fires when the client sets up the mirroring audio stream (SETUP <c>type: 96</c>) — the hook the app uses to spin up an AAC-ELD decoder + audio output for that receiver's <see cref="MirrorAudioReceiver.AudioFrameReceived"/>.</summary>
+    public event Action<MirrorAudioReceiver>? MirrorAudioSessionStarted;
+
     public AirPlayReceiverServer(int port, ReceiverIdentity identity, string deviceId)
     {
         _listener = new TcpListener(IPAddress.Any, port);
@@ -105,6 +108,7 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
         finally
         {
             if (mirror.DataReceiver is not null) await mirror.DataReceiver.DisposeAsync().ConfigureAwait(false);
+            if (mirror.AudioReceiver is not null) await mirror.AudioReceiver.DisposeAsync().ConfigureAwait(false);
             if (mirror.Timing is not null) await mirror.Timing.DisposeAsync().ConfigureAwait(false);
             mirror.TimingSocket?.Dispose();
             client.Dispose();
@@ -123,8 +127,10 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
     private sealed class MirrorSetupState(TcpClient client)
     {
         public byte[]? SessionAesKey { get; set; }
+        public byte[]? SessionEiv { get; set; }        // the raw 16-byte eiv — used as the audio AES-CBC IV
         public UdpClient? TimingSocket { get; set; }
         public NtpTimingSession? Timing { get; set; }
+        public MirrorAudioReceiver? AudioReceiver { get; set; }
 
         private MirroringDataReceiver? _dataReceiver;
         public MirroringDataReceiver? DataReceiver
@@ -227,6 +233,7 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
                 ? rawKey
                 : Sha.Sha512([.. rawKey, .. ecdh])[..16];
             mirror.SessionAesKey = sessionKey;
+            mirror.SessionEiv = eivNode.DataValue.Length == 16 ? eivNode.DataValue : null;
             Trace($"  chiave di sessione decifrata: {Convert.ToHexString(sessionKey)}");
 
             // A second ekey/eiv-bearing SETUP on the same connection (retry/
@@ -359,6 +366,36 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
                     resStreams.Add(new PlistDictBuilder()
                         .Add("dataPort", (long)receiver.LocalPort)
                         .Add("type", 110L)
+                        .Build());
+                }
+                else if (type == 96) // Mirroring audio (AAC-ELD, per the ct/spf fields dumped above)
+                {
+                    if (mirror.SessionAesKey is null || mirror.SessionEiv is null)
+                    {
+                        Trace("  SETUP audio senza chiave/eiv di sessione — rifiuto");
+                        return (BuildStatusResponse(request, 400, "Bad Request"), true);
+                    }
+
+                    if (mirror.AudioReceiver is not null)
+                    {
+                        MirrorAudioReceiver oldAudio = mirror.AudioReceiver;
+                        _ = Task.Run(async () => { try { await oldAudio.DisposeAsync().ConfigureAwait(false); } catch { } });
+                    }
+
+                    // Audio uses the same FairPlay session key as the video (UxPlay's
+                    // raop_handler_setup: the aeskey/aesiv derived on the first SETUP are
+                    // reused for the RTP audio), IV = the raw session eiv, AES-128-CBC.
+                    var audio = new MirrorAudioReceiver(mirror.SessionAesKey, mirror.SessionEiv);
+                    audio.Diagnostics += msg => Trace($"  [audio mirroring] {msg}");
+                    audio.Start();
+                    mirror.AudioReceiver = audio;
+                    MirrorAudioSessionStarted?.Invoke(audio);
+                    Trace($"  stream audio: in ascolto su dataPort {audio.DataPort} / controlPort {audio.ControlPort}");
+
+                    resStreams.Add(new PlistDictBuilder()
+                        .Add("dataPort", (long)audio.DataPort)
+                        .Add("controlPort", (long)audio.ControlPort)
+                        .Add("type", 96L)
                         .Build());
                 }
                 else

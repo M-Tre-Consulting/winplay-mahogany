@@ -90,6 +90,7 @@ public partial class App : Application
             // app with no attached console.
             _receiverServer.Diagnostics += AppLog.Write;
             _receiverServer.MirroringSessionStarted += OnMirroringSessionStarted;
+            _receiverServer.MirrorAudioSessionStarted += OnMirrorAudioSessionStarted;
             _receiverServer.Start();
             AppLog.Write($"Ricevitore di mirroring avviato sulla porta {MirroringPort}");
         }
@@ -126,6 +127,59 @@ public partial class App : Application
             catch (Exception ex)
             {
                 AppLog.Write($"Creazione di MirrorWindow fallita: {ex}");
+            }
+        });
+    }
+
+    /// <summary>
+    /// The client set up the mirroring audio stream: stand up an AAC-ELD decoder and an
+    /// AudioGraph output, and pipe every decrypted frame through them. No window — audio
+    /// just plays alongside whatever MirrorWindow is showing.
+    /// </summary>
+    private void OnMirrorAudioSessionStarted(MirrorAudioReceiver receiver)
+    {
+        AppLog.Write("MirrorAudioSessionStarted: avvio decoder AAC-ELD + AudioGraph");
+        _ = Task.Run(async () =>
+        {
+            AacEldDecoder? decoder = null;
+            MirrorAudioPlayer? player = null;
+            try
+            {
+                decoder = new AacEldDecoder();
+                player = new MirrorAudioPlayer(decoder.SampleRate, decoder.Channels) { Diagnostics = AppLog.Write };
+                await player.StartAsync();
+
+                int decoded = 0;
+                void OnFrame(byte[] aac)
+                {
+                    try
+                    {
+                        short[]? pcm = decoder!.Decode(aac);
+                        if (pcm is null) return;
+                        player!.Enqueue(pcm);
+                        if (++decoded is <= 5 or 500 || decoded % 2000 == 0)
+                            AppLog.Write($"  audio: frame #{decoded} decodificato ({pcm.Length} campioni, {decoder.SampleRate}Hz {decoder.Channels}ch)");
+                    }
+                    catch (Exception ex) { AppLog.Write($"  audio decode/enqueue fallito: {ex.Message}"); }
+                }
+
+                AacEldDecoder d = decoder;
+                MirrorAudioPlayer p = player;
+                receiver.AudioFrameReceived += OnFrame;
+                receiver.SessionEnded += () =>
+                {
+                    AppLog.Write("MirrorAudioReceiver: sessione audio terminata");
+                    receiver.AudioFrameReceived -= OnFrame;
+                    _ = p.DisposeAsync();
+                    d.Dispose();
+                };
+                AppLog.Write("Audio mirroring pronto");
+            }
+            catch (Exception ex)
+            {
+                AppLog.Write($"Avvio audio mirroring fallito: {ex}");
+                if (player is not null) await player.DisposeAsync();
+                decoder?.Dispose();
             }
         });
     }
