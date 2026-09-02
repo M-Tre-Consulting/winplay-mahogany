@@ -18,7 +18,7 @@
 ; the installer/uninstaller entry; everything else rarely needs to change.
 
 #define MyAppName "WinPlay Mahogany"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.2.0"
 #define MyAppPublisher "M-Tre Consulting"
 #define MyAppExeName "AirPlaySender.App.exe"
 #define MyPublishDir "..\src\AirPlaySender.App\bin\Release\net9.0-windows10.0.19041.0\win-x64\publish"
@@ -52,6 +52,16 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "{#MyPublishDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+
+[Registry]
+; The app writes this HKCU\Run value itself on every launch ("start with Windows",
+; self-healing) — the installer never creates it, it just cleans it up on uninstall
+; so a dead entry isn't left pointing at a removed exe.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "WinPlay Mahogany"; Flags: uninsdeletevalue
+
+[UninstallDelete]
+; The app's own on-disk log, created at runtime next to the exe (not by this installer).
+Type: files; Name: "{app}\mirroring.log"
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
