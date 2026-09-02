@@ -113,6 +113,8 @@ public partial class App : Application
                 lock (_mirrorWindows) _mirrorWindows.Add(mirrorWindow);
                 mirrorWindow.Closed += (_, _) =>
                 {
+                    bool userClose = mirrorWindow.ShouldRequestSessionClose;
+                    AppLog.Write($"MirrorWindow.Closed (chiusura utente col pulsante X: {userClose})");
                     mirrorWindow.Detach(receiver);
                     lock (_mirrorWindows) _mirrorWindows.Remove(mirrorWindow);
                     // Only for a real, user-initiated close (the X button) — NOT when this
@@ -120,7 +122,11 @@ public partial class App : Application
                     // this backwards took the real session down as collateral damage of the
                     // proactive-offer receiver's own routine cleanup (see MirrorWindow's doc
                     // comment on ShouldRequestSessionClose) — confirmed live, fixed here.
-                    if (mirrorWindow.ShouldRequestSessionClose) receiver.RequestSessionClose();
+                    if (userClose)
+                    {
+                        AppLog.Write("  -> chiudo la sessione di mirroring sul telefono");
+                        receiver.RequestSessionClose();
+                    }
                 };
                 AppLog.Write("MirrorWindow creata e agganciata");
             }

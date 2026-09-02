@@ -140,10 +140,23 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
             set
             {
                 _dataReceiver = value;
-                // Closing our render window (or the session ending on its own) closes the RTSP
-                // control connection too, so the phone notices and stops mirroring instead of
-                // going on thinking it still is.
-                if (value is not null) value.CloseSessionRequested += () => { try { client.Close(); } catch { } };
+                // The user closed the render window: cut every socket the iPhone is watching
+                // so it drops the mirror right away instead of streaming into the void. The
+                // VIDEO data TCP connection first (its raop_rtp_mirror thread reads that
+                // continuously and tears the session down the instant it fails), then the
+                // audio UDP sockets, then the RTSP control connection.
+                if (value is not null)
+                    value.CloseSessionRequested += () =>
+                    {
+                        MirroringDataReceiver? dr = _dataReceiver;
+                        MirrorAudioReceiver? ar = AudioReceiver;
+                        _ = Task.Run(async () =>
+                        {
+                            if (dr is not null) { try { await dr.DisposeAsync().ConfigureAwait(false); } catch { } }
+                            if (ar is not null) { try { await ar.DisposeAsync().ConfigureAwait(false); } catch { } }
+                        });
+                        try { client.Close(); } catch { }
+                    };
             }
         }
     }

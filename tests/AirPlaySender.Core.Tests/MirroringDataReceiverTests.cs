@@ -96,4 +96,35 @@ public class MirroringDataReceiverTests
 
         Assert.Equal(1, sessionEndedCount);
     }
+
+    [Fact]
+    public async Task RequestSessionCloseRaisesCloseSessionRequested()
+    {
+        // The render window's X button rides on this: RequestSessionClose ->
+        // CloseSessionRequested -> AirPlayReceiverServer cuts the data/audio/RTSP
+        // sockets so the phone drops the mirror.
+        await using var receiver = new MirroringDataReceiver();
+        int closeCount = 0;
+        receiver.CloseSessionRequested += () => Interlocked.Increment(ref closeCount);
+
+        receiver.RequestSessionClose();
+
+        Assert.Equal(1, closeCount);
+    }
+
+    [Fact]
+    public async Task DisposeAsyncIsIdempotent()
+    {
+        // It gets called from BOTH the window's close path and the RTSP connection's
+        // finally — the second call must be a harmless no-op, and SessionEnded fires once.
+        var receiver = new MirroringDataReceiver();
+        int ended = 0;
+        receiver.SessionEnded += () => Interlocked.Increment(ref ended);
+        receiver.Start();
+
+        await receiver.DisposeAsync();
+        await receiver.DisposeAsync();
+
+        Assert.Equal(1, ended);
+    }
 }

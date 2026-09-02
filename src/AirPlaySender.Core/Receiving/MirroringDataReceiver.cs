@@ -84,7 +84,11 @@ public sealed class MirroringDataReceiver : IAsyncDisposable
     public event Action? CloseSessionRequested;
 
     /// <summary>Call when the user closes the window showing this session — see <see cref="CloseSessionRequested"/>.</summary>
-    public void RequestSessionClose() => CloseSessionRequested?.Invoke();
+    public void RequestSessionClose()
+    {
+        Trace($"RequestSessionClose (chiusura dalla finestra) — {CloseSessionRequested?.GetInvocationList().Length ?? 0} gestori");
+        CloseSessionRequested?.Invoke();
+    }
 
     // --- late-subscriber replay -------------------------------------------------------
     // The renderer window is created on the UI thread, one dispatcher hop after the data
@@ -377,15 +381,18 @@ public sealed class MirroringDataReceiver : IAsyncDisposable
 
     private void Trace(string message) => Diagnostics?.Invoke(message);
 
+    private int _disposed;
+
     public async ValueTask DisposeAsync()
     {
-        _cts.Cancel();
-        _listener.Stop();
+        if (Interlocked.Exchange(ref _disposed, 1) == 1) return; // idempotent — can be closed from the window AND the RTSP finally
+        try { _cts.Cancel(); } catch { }
+        try { _listener.Stop(); } catch { }
         if (_acceptLoop is not null)
         {
             try { await _acceptLoop.ConfigureAwait(false); }
             catch { /* best-effort shutdown */ }
         }
-        _cts.Dispose();
+        try { _cts.Dispose(); } catch { }
     }
 }

@@ -199,17 +199,20 @@ public sealed class MirrorAudioReceiver : IAsyncDisposable
 
     private void Trace(string m) => Diagnostics?.Invoke(m);
 
+    private int _disposed;
+
     public async ValueTask DisposeAsync()
     {
-        _cts.Cancel();
-        _data.Dispose();
-        _control.Dispose();
+        if (Interlocked.Exchange(ref _disposed, 1) == 1) return; // idempotent
+        try { _cts.Cancel(); } catch { }
+        try { _data.Dispose(); } catch { }
+        try { _control.Dispose(); } catch { }
         if (_loop is not null)
         {
             try { await _loop.ConfigureAwait(false); }
             catch { /* best-effort */ }
         }
-        _aes.Dispose();
-        _cts.Dispose();
+        try { _aes.Dispose(); } catch { }
+        try { _cts.Dispose(); } catch { }
     }
 }
