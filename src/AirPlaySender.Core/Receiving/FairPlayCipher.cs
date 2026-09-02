@@ -47,6 +47,13 @@ namespace AirPlaySender.Core.Receiving;
 /// C source for the same reason — not because it was understood, but so it
 /// could be diffed against the original if it's ever found not to match.
 /// </summary>
+// CS0675 ("bitwise-OR on a sign-extended operand") fires ~18 times below. It is
+// EXPECTED here: this is a character-for-character port of C where small integer
+// types sign/zero-extend to int per the C promotion rules, and the code is only
+// valid if it stays textually identical to the reference (verified byte-for-byte
+// against a real iPhone). Rewriting the flagged sub-expressions to silence the
+// warning would be exactly the kind of "improvement" this port must not make.
+#pragma warning disable CS0675
 public static class FairPlayCipher
 {
     /// <summary>
@@ -745,3 +752,4 @@ public static class FairPlayCipher
     }
 
 }
+#pragma warning restore CS0675

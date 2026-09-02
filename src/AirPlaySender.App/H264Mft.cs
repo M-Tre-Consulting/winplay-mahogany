@@ -41,8 +41,6 @@ internal sealed class H264Mft : IDisposable
     private const int MF_E_TRANSFORM_NEED_MORE_INPUT = unchecked((int)0xC00D6D72);
     private const int MF_E_TRANSFORM_STREAM_CHANGE = unchecked((int)0xC00D6D61);
     private const int MF_E_NOTACCEPTING = unchecked((int)0xC00D36B5);
-    private const int MFT_OUTPUT_STREAM_PROVIDES_SAMPLES = 0x100;
-    private const uint MFT_ENUM_FLAG_SYNCMFT = 0x1;
     private const int CLSCTX_INPROC_SERVER = 1;
     private const uint MFVideoInterlace_Progressive = 2;
 
@@ -158,60 +156,54 @@ internal sealed class H264Mft : IDisposable
         sample.Dispose();
     }
 
+    // Output sample/buffer for the software decoder, allocated once and reused every
+    // frame — MFCreateMemoryBuffer of a ~1.5 MB NV12 frame 60 times a second was pure
+    // COM allocation churn. Grown (not just reallocated) only if a STREAM_CHANGE asks
+    // for more. The MFT's output stream does not provide its own samples (stock
+    // CMSH264DecoderMFT), so we always supply this one.
+    private IMFSample? _outSample;
+    private IMFMediaBuffer? _outBuffer;
+    private int _outBufferSize;
+
+    private void EnsureOutputBuffer()
+    {
+        OutputStreamInfo info = _mft.GetOutputStreamInfo(0);
+        int need = Math.Max(info.Size, _stride * _codedH * 3 / 2 + 64);
+        if (_outSample is not null && _outBufferSize >= need) return;
+
+        _outBuffer?.Dispose();
+        _outSample?.Dispose();
+        _outBuffer = MediaFactory.MFCreateMemoryBuffer(need);
+        _outSample = MediaFactory.MFCreateSample();
+        _outSample.AddBuffer(_outBuffer);
+        _outBufferSize = need;
+    }
+
     private void DrainOutputs()
     {
+        EnsureOutputBuffer();
         while (true)
         {
-            // Re-read each iteration: a STREAM_CHANGE below renegotiates the output type,
-            // which changes the required buffer size.
-            OutputStreamInfo info = _mft.GetOutputStreamInfo(0);
-            bool mftAllocates = (info.Flags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) != 0;
-            int bufSize = Math.Max(info.Size, _stride * _codedH * 3 / 2 + 64);
+            _outBuffer!.CurrentLength = 0; // reset for reuse — the MFT writes the real length
 
-            IMFSample? ours = null;
-            IMFMediaBuffer? ourBuf = null;
-            if (!mftAllocates)
-            {
-                ours = MediaFactory.MFCreateSample();
-                ourBuf = MediaFactory.MFCreateMemoryBuffer(bufSize);
-                ours.AddBuffer(ourBuf);
-            }
-
-            var db = new OutputDataBuffer { StreamID = 0, Sample = ours! };
+            var db = new OutputDataBuffer { StreamID = 0, Sample = _outSample! };
             Result hr = _mft.ProcessOutput(ProcessOutputFlags.None, 1, ref db, out _);
 
             // db.Sample after the call is a fresh managed wrapper around the SAME native
-            // pointer as `ours`, created WITHOUT an AddRef (SharpGen's struct __MarshalFrom).
-            // So it must NEVER be Disposed when we supplied the sample — doing so
-            // double-releases `ours` and corrupts the heap a few dozen frames later
-            // ("crashed a caso", window gone, no log). Only touch what we actually own:
-            // `ours` when we allocated it, or db.Sample only when the MFT allocated it.
-            if (hr.Code == MF_E_TRANSFORM_NEED_MORE_INPUT)
-            {
-                ourBuf?.Dispose();
-                ours?.Dispose();
-                return;
-            }
+            // pointer as _outSample, created WITHOUT an AddRef (SharpGen's struct
+            // __MarshalFrom). It must NEVER be Disposed — doing so double-releases
+            // _outSample and corrupts the heap a few dozen frames later ("crashed a caso",
+            // window gone, no log). We only ever read the frame back through _outSample.
+            if (hr.Code == MF_E_TRANSFORM_NEED_MORE_INPUT) return;
             if (hr.Code == MF_E_TRANSFORM_STREAM_CHANGE)
             {
-                ourBuf?.Dispose();
-                ours?.Dispose();
-                NegotiateOutput(); // decoder learned the real coded size — re-read it
+                NegotiateOutput();   // decoder learned the real coded size
+                EnsureOutputBuffer(); // ...which may need a bigger buffer
                 continue;
             }
             hr.CheckError();
 
-            if (mftAllocates)
-            {
-                IMFSample produced = db.Sample;
-                try { EmitFrame(produced); } finally { produced.Dispose(); }
-            }
-            else
-            {
-                EmitFrame(ours!);
-                ourBuf!.Dispose();
-                ours!.Dispose();
-            }
+            EmitFrame(_outSample!);
         }
     }
 
@@ -281,6 +273,8 @@ internal sealed class H264Mft : IDisposable
     {
         try { _mft?.ProcessMessage(TMessageType.MessageNotifyEndOfStream, UIntPtr.Zero); } catch { }
         try { _mft?.ProcessMessage(TMessageType.MessageNotifyEndStreaming, UIntPtr.Zero); } catch { }
+        try { _outBuffer?.Dispose(); } catch { }
+        try { _outSample?.Dispose(); } catch { }
         try { _mft?.Dispose(); } catch { }
         if (_mfStarted) { try { MediaFactory.MFShutdown(); } catch { } _mfStarted = false; }
     }

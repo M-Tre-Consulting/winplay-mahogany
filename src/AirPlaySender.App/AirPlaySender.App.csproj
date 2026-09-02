@@ -39,6 +39,14 @@
     <SatelliteResourceLanguages>it;en</SatelliteResourceLanguages>
   </PropertyGroup>
 
+  <!-- Release/installer only: the app does no culture-aware formatting beyond
+       a handful of explicit CultureInfo.InvariantCulture calls, so drop ICU —
+       ~27 MB out of the self-contained publish. Debug builds keep it so nothing
+       surprising happens while iterating. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
   <ItemGroup>
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.6.250108002" />
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.1742" />

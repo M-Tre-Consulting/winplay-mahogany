@@ -82,6 +82,23 @@ foreach ($name in $deadWeightDlls) {
 }
 Write-Host ("   removed {0:N1} MB" -f ($removedBytes / 1MB))
 
+# The fdk-aac NuGet ships both the decoder (libAACdec.dll, which AacEldDecoder.cs
+# P/Invokes) and the encoder (libAACenc.dll, which nothing here touches). Drop the
+# encoder. Belt-and-braces: also drop any ICU payload that slipped through despite
+# InvariantGlobalization (there normally is none).
+Write-Host "==> Stripping the unused fdk-aac encoder + stray ICU" -ForegroundColor Cyan
+$strippedBytes = 0
+$strayFiles = @(Join-Path $publishDir "libAACenc.dll")
+$strayFiles += Get-ChildItem $publishDir -Filter "icu*.dll" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+foreach ($path in $strayFiles) {
+    if (Test-Path $path) {
+        $strippedBytes += (Get-Item $path).Length
+        Remove-Item $path -Force
+        Write-Host "   removed $(Split-Path $path -Leaf)"
+    }
+}
+Write-Host ("   removed {0:N1} MB" -f ($strippedBytes / 1MB))
+
 if (-not (Test-Path $InnoCompiler)) {
     throw "Inno Setup compiler not found at '$InnoCompiler'. Install it (winget install JRSoftware.InnoSetup) or pass -InnoCompiler <path>."
 }

@@ -93,10 +93,41 @@ public static class AvcDecoderConfig
         {
             int len = (data[pos] << 24) | (data[pos + 1] << 16) | (data[pos + 2] << 8) | data[pos + 3];
             pos += 4;
-            if (len < 0 || pos + len > data.Length) break; // malformed tail — keep whatever parsed cleanly so far
+            if (len < 0 || len > data.Length - pos) break; // malformed tail — keep whatever parsed cleanly so far
             result.Add(data.Slice(pos, len).ToArray());
             pos += len;
         }
         return result;
+    }
+
+    /// <summary>
+    /// Rewrites a decrypted mirroring VCL payload from AVCC (4-byte big-endian length
+    /// prefix per NAL) to Annex-B (<c>00 00 00 01</c> start code) <b>in place</b> — the
+    /// two framings are the same 4 bytes wide, so the whole payload becomes a valid
+    /// Annex-B access unit with no copy at all (the hot path is ~60 P-frames/second).
+    /// Reports what's inside so the caller can decide whether to prepend SPS/PPS or drop.
+    /// Returns false only if nothing parsed as a NAL.
+    /// </summary>
+    public static bool RewriteAvccToAnnexBInPlace(Span<byte> data, out bool hasKeyFrame, out bool hasVcl, out bool startsWithSps)
+    {
+        hasKeyFrame = false;
+        hasVcl = false;
+        startsWithSps = false;
+        int pos = 0;
+        bool first = true, any = false;
+        while (pos + 4 <= data.Length)
+        {
+            int len = (data[pos] << 24) | (data[pos + 1] << 16) | (data[pos + 2] << 8) | data[pos + 3];
+            if (len <= 0 || len > data.Length - pos - 4) break; // trailing garbage — keep what parsed cleanly
+            data[pos] = 0; data[pos + 1] = 0; data[pos + 2] = 0; data[pos + 3] = 1;
+
+            int nalType = data[pos + 4] & 0x1F;
+            if (first) { startsWithSps = nalType == 7; first = false; }
+            if (nalType == 5) hasKeyFrame = true;
+            if (nalType is >= 1 and <= 5) hasVcl = true;
+            any = true;
+            pos += 4 + len;
+        }
+        return any;
     }
 }

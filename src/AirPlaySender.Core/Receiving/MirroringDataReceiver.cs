@@ -315,27 +315,21 @@ public sealed class MirroringDataReceiver : IAsyncDisposable
     {
         byte[] decrypted = _videoCipher!.Transform(encryptedPayload);
 
-        // The wire payload is one or more NALs, each with a 4-byte big-endian length
-        // prefix (AVCC). Split them out; a byte-perfect decrypt makes this exact, and
-        // a malformed split (which would mean the keystream drifted) yields nothing
-        // and the frame is skipped rather than fed in as garbage.
-        List<byte[]> nals = AvcDecoderConfig.SplitAvccNalUnits(decrypted);
-        nals.RemoveAll(n => n.Length == 0);
-        if (nals.Count == 0)
+        // AVCC (4-byte big-endian length prefix per NAL) -> Annex-B (00 00 00 01), in
+        // place: same width, so `decrypted` itself becomes a valid access unit with zero
+        // copies. A byte-perfect decrypt makes the framing exact; if it doesn't parse the
+        // frame is dropped rather than fed in as garbage.
+        if (!AvcDecoderConfig.RewriteAvccToAnnexBInPlace(decrypted, out bool hasKeyFrame, out bool hasVcl, out bool startsWithSps))
         {
             Trace("  frame video senza NAL validi dopo la decifratura — scartato");
             return;
         }
 
-        bool hasKeyFrame = nals.Exists(n => (n[0] & 0x1F) == 5);   // NAL type 5 = IDR slice
-        bool hasSlice = nals.Exists(n => (n[0] & 0x1F) is >= 1 and <= 5);
-        bool startsWithSps = (nals[0][0] & 0x1F) == 7;
-
-        if (!hasSlice)
+        if (!hasVcl)
         {
             // Non-VCL only (SEI/AUD/parameter sets on their own) — stash and glue onto
             // the next real frame instead of shipping a "frame" with no picture in it.
-            foreach (byte[] n in nals) { _pendingPrefix.AddRange(AnnexBStartCode); _pendingPrefix.AddRange(n); }
+            _pendingPrefix.AddRange(decrypted);
             return;
         }
 
@@ -347,14 +341,26 @@ public sealed class MirroringDataReceiver : IAsyncDisposable
             return;
         }
 
-        var annexB = new List<byte>(decrypted.Length + 64);
-        if (hasKeyFrame && _spsPpsAnnexB is not null && !startsWithSps)
-            annexB.AddRange(_spsPpsAnnexB);
-        if (_pendingPrefix.Count > 0) { annexB.AddRange(_pendingPrefix); _pendingPrefix.Clear(); }
-        foreach (byte[] n in nals) { annexB.AddRange(AnnexBStartCode); annexB.AddRange(n); }
+        bool needSpsPps = hasKeyFrame && _spsPpsAnnexB is not null && !startsWithSps;
+        bool needPrefix = _pendingPrefix.Count > 0;
+
+        byte[] annexB;
+        if (!needSpsPps && !needPrefix)
+        {
+            annexB = decrypted; // the common P-frame path — hand the buffer straight through
+        }
+        else
+        {
+            int lead = (needSpsPps ? _spsPpsAnnexB!.Length : 0) + (needPrefix ? _pendingPrefix.Count : 0);
+            annexB = new byte[lead + decrypted.Length];
+            int o = 0;
+            if (needSpsPps) { _spsPpsAnnexB!.CopyTo(annexB, o); o += _spsPpsAnnexB.Length; }
+            if (needPrefix) { _pendingPrefix.CopyTo(annexB, o); o += _pendingPrefix.Count; _pendingPrefix.Clear(); }
+            decrypted.CopyTo(annexB, o);
+        }
 
         if (hasKeyFrame) _emittedKeyFrame = true;
-        EmitFrame(new MirroringVideoFrame([.. annexB], hasKeyFrame, timestampNs));
+        EmitFrame(new MirroringVideoFrame(annexB, hasKeyFrame, timestampNs));
     }
 
     // Set by the caller right after construction, once the stream-level SETUP

@@ -58,4 +58,39 @@ public class AvcDecoderConfigTests
         Assert.Equal(new byte[] { 0x11, 0x22 }, nals[0]);
         Assert.Equal(new byte[] { 0x33 }, nals[1]);
     }
+
+    [Fact]
+    public void RewriteAvccToAnnexBInPlaceSwapsLengthPrefixesForStartCodes()
+    {
+        // Two NALs: [len 3][0x67 SPS ..] [len 2][0x65 IDR ..]
+        byte[] data = [0x00, 0x00, 0x00, 0x03, 0x67, 0xAA, 0xBB, 0x00, 0x00, 0x00, 0x02, 0x65, 0xCC];
+
+        bool ok = AvcDecoderConfig.RewriteAvccToAnnexBInPlace(data, out bool hasKeyFrame, out bool hasVcl, out bool startsWithSps);
+
+        Assert.True(ok);
+        Assert.True(hasKeyFrame);   // NAL type 5 present
+        Assert.True(hasVcl);
+        Assert.True(startsWithSps); // first NAL is type 7
+        Assert.Equal(new byte[] { 0x00, 0x00, 0x00, 0x01, 0x67, 0xAA, 0xBB, 0x00, 0x00, 0x00, 0x01, 0x65, 0xCC }, data);
+    }
+
+    [Fact]
+    public void RewriteAvccToAnnexBInPlaceReportsAPFrameOnlyPayload()
+    {
+        byte[] data = [0x00, 0x00, 0x00, 0x02, 0x41, 0x99]; // NAL type 1 = non-IDR slice
+        bool ok = AvcDecoderConfig.RewriteAvccToAnnexBInPlace(data, out bool hasKeyFrame, out bool hasVcl, out bool startsWithSps);
+
+        Assert.True(ok);
+        Assert.False(hasKeyFrame);
+        Assert.True(hasVcl);
+        Assert.False(startsWithSps);
+        Assert.Equal(new byte[] { 0x00, 0x00, 0x00, 0x01, 0x41, 0x99 }, data);
+    }
+
+    [Fact]
+    public void RewriteAvccToAnnexBInPlaceReturnsFalseOnGarbage()
+    {
+        byte[] data = [0x7F, 0xFF, 0xFF, 0xFF, 0x01]; // absurd length prefix
+        Assert.False(AvcDecoderConfig.RewriteAvccToAnnexBInPlace(data, out _, out _, out _));
+    }
 }
