@@ -1,56 +1,86 @@
-using System.Runtime.InteropServices.WindowsRuntime;
+using System.Linq;
 using System.Threading;
-using System.Threading.Channels;
 using AirPlaySender.Core.Receiving;
+using Microsoft.Graphics.Canvas;
+using Microsoft.Graphics.Canvas.UI.Xaml;
 using Microsoft.UI;
+using Microsoft.UI.Dispatching;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
-using Windows.Media.Core;
-using Windows.Media.MediaProperties;
-using Windows.Media.Playback;
-using Windows.Storage.Streams;
+using Windows.Foundation;
+using Windows.Graphics.DirectX;
 using WinRT.Interop;
 
 namespace AirPlaySender.App;
 
 /// <summary>
-/// The window that actually shows the mirrored iPhone screen — subscribes
-/// directly to one <see cref="MirroringDataReceiver"/>'s SPS/PPS and NAL
-/// events (see <see cref="AirPlayReceiverServer.MirroringSessionStarted"/>)
-/// and feeds them into a WinRT <see cref="MediaStreamSource"/>, which does
-/// the actual H.264 decode (hardware-accelerated, via the OS) and rendering
-/// through a <see cref="MediaPlayerElement"/>.
+/// The window that shows the mirrored iPhone screen. It subscribes to one
+/// <see cref="MirroringDataReceiver"/> and runs its own decode pipeline:
+/// each Annex-B access unit off the queue is fed straight to the Windows
+/// H.264 decoder MFT (<see cref="H264Mft"/>), and every decoded frame is
+/// blitted onto a Win2D <see cref="CanvasSwapChainPanel"/>.
 ///
-/// Confirmed against Microsoft's own reference implementation
-/// (webrtc-uwp's <c>impl_webrtc_MediaStreamSource.cpp</c>, a real,
-/// shipped custom-H264-over-MediaStreamSource integration) before writing
-/// this, not guessed: a <see cref="MediaStreamSource"/> built from
-/// <see cref="VideoEncodingProperties.CreateH264"/> wants **Annex-B**
-/// (<c>00 00 00 01</c> start codes) samples, SPS/PPS included as ordinary
-/// in-band samples — not the AVCC framing <see cref="MirroringDataReceiver"/>
-/// hands over, which is why every sample gets re-prefixed here before being
-/// handed to the pipeline. Tried switching to AVCC + <c>SetFormatUserData</c>
-/// (matching how virtually every real MP4 on Windows is fed to this same
-/// decoder) as a later experiment, reasoning CreateH264()'s Annex-B
-/// expectation might just be about the in-band-vs-extradata SPS/PPS
-/// convention — confirmed live that it isn't: <c>MediaOpened</c> stopped
-/// firing at all (worse than Annex-B's "renders then freezes"), so
-/// CreateH264()'s preset is tied to Annex-B framing itself, not just where
-/// the parameter sets come from. Reverted.
+/// This is the third rendering approach for the same bug ("perfect image
+/// for ~1s, then frozen solid"). The first (MediaPlayerElement) and second
+/// (MediaPlayer frame-server mode + Win2D) both wedged the same way, with
+/// the data pipeline provably healthy the whole time — <see cref="H264Mft"/>
+/// removes MediaPlayer / MediaStreamSource entirely, so there is no hidden
+/// clock or buffering heuristic left to stall. See README, "La caccia al
+/// bug del rendering".
+///
+/// A live iPhone mirror stream sends exactly one IDR, at the start, then
+/// only P-frames indefinitely — so frames are delivered whole and in order
+/// and NEVER dropped (one gap makes everything after it undecodable until
+/// the phone volunteers another IDR, which may be a long way off). A hard
+/// cap only exists to notice a genuinely wedged pipeline and end the
+/// session so the user can start a clean one.
 /// </summary>
 public sealed partial class MirrorWindow : Window
 {
-    private readonly Channel<byte[]> _samples = Channel.CreateUnbounded<byte[]>();
-    // Reset in StartPipeline, right before Play() — NOT the moment this constructor runs.
-    // Between construction and the pipeline actually starting, Attach() + waiting for the
-    // phone's SPS/PPS packet can burn real wall-clock time; leaving this at construction
-    // time meant the very first sample's timestamp was already offset from zero by however
-    // long that took, while SetActualStartPosition(TimeSpan.Zero) told the engine playback
-    // starts AT zero — a real, avoidable mismatch between what we declared and what we did.
-    private DateTime _streamStart = DateTime.UtcNow;
-    private MediaStreamSource? _mss;
-    private MediaPlayer? _player;
+    private sealed class QueuedSample(byte[] annexB, TimeSpan pts, bool isKeyFrame)
+    {
+        public byte[] AnnexB { get; } = annexB;
+        public TimeSpan Pts { get; } = pts;
+        public bool IsKeyFrame { get; } = isKeyFrame;
+    }
+
+    private readonly object _queueGate = new();
+    private readonly Queue<QueuedSample> _queue = new();
+    // Counts frames sitting in _queue (one Release per enqueue, one Wait per dequeue).
+    private readonly SemaphoreSlim _framesAvailable = new(0);
+    // Cancelled when the window/session is finished — stops the decode thread.
+    private readonly CancellationTokenSource _closed = new();
+
+    private const int HardCapFrames = 900; // ~15s at 60fps
+    private bool _forcedClose;
+
+    // PTS timeline state (guarded by _queueGate; touched from the receiver thread).
+    private ulong? _firstTimestampNs;
+    private long _lastPtsTicks = -1;
+
     private bool _configured;
+    private int _videoWidth = 1920, _videoHeight = 1080;
+    private volatile bool _ended;
+
+    // ---- decode + render ------------------------------------------------------------
+    private H264Mft? _decoder;
+    private Thread? _decodeThread;
+    private int _framesIn;
+    private int _framesDecoded;
+    private long _framesShown;
+    private DateTime _lastDecodedUtc;
+    private DateTime _lastFrameShownUtc;
+
+    // Win2D surface. Device is created lazily (first CanvasDevice.GetSharedDevice() can
+    // take a few hundred ms) and pre-warmed at startup (App.xaml.cs). _renderGate guards
+    // the swap chain / render target against the (cold) resize path swapping them out
+    // from the UI thread while the decode thread is mid-present.
+    private readonly object _renderGate = new();
+    private CanvasDevice? _canvasDevice;
+    private CanvasSwapChainPanel? _swapPanel;
+    private CanvasSwapChain? _swapChain;
+    private CanvasRenderTarget? _renderTarget; // persistent blit target — SetPixelBytes each frame, no per-frame GPU alloc
+    private int _surfaceWidth, _surfaceHeight;
 
     public MirrorWindow()
     {
@@ -72,32 +102,43 @@ public sealed partial class MirrorWindow : Window
         catch { /* cosmetic only */ }
     }
 
-    /// <summary>Attaches this window to one mirroring session's events. Call once, right after construction.</summary>
+    /// <summary>Attaches this window to one mirroring session. The receiver replays any config/frames that already arrived before this hop ran.</summary>
     public void Attach(MirroringDataReceiver receiver)
     {
-        receiver.ConfigReceived += OnConfigReceived;
-        receiver.NalReceived += OnNalReceived;
-        receiver.SessionEnded += OnSessionEnded;
-        AppLog.Write("MirrorWindow.Attach: in ascolto di ConfigReceived/NalReceived/SessionEnded");
+        receiver.AttachRenderer(OnConfigReceived, OnFrameReceived, OnSessionEnded);
+        AppLog.Write("MirrorWindow.Attach: agganciato (con replay di config/frame già arrivati)");
+    }
+
+    /// <summary>Detaches from the receiver and tears down the pipeline — call when the mirroring session ends.</summary>
+    public void Detach(MirroringDataReceiver receiver)
+    {
+        receiver.DetachRenderer(OnConfigReceived, OnFrameReceived, OnSessionEnded);
+        _ended = true;
+        try { _closed.Cancel(); } catch { }
+        TearDownDecoder();
+        lock (_renderGate)
+        {
+            try { _swapChain?.Dispose(); } catch { }
+            try { _renderTarget?.Dispose(); } catch { }
+            _swapChain = null;
+            _renderTarget = null;
+        }
     }
 
     /// <summary>
     /// True once this window is closing because <see cref="OnSessionEnded"/> fired, as
-    /// opposed to the user clicking the window's own close button. App.xaml.cs checks this
-    /// before calling <see cref="MirroringDataReceiver.RequestSessionClose"/> on <see
-    /// cref="Closed"/> — without it, a window that auto-closes because ITS OWN receiver was
-    /// superseded (the proactive-offer receiver every session briefly creates, replaced the
-    /// instant a real streams-array SETUP arrives — see AirPlayReceiverServer) would end up
-    /// closing the shared RTSP connection too, taking the real, just-started session down
-    /// with it — confirmed live: connect, then an near-instant disconnect with no video ever
-    /// shown, from exactly this.
+    /// opposed to the user closing it. App.xaml.cs checks this before calling
+    /// <see cref="MirroringDataReceiver.RequestSessionClose"/> on <see cref="Closed"/> —
+    /// without it, the proactive-offer window closing itself would take the shared RTSP
+    /// connection (and the real, just-started session) down with it.
     /// </summary>
     private bool _closingBecauseSessionEnded;
 
-    /// <summary>The phone stopped mirroring (or the connection otherwise ended) — close instead of sitting there showing a frozen last frame forever.</summary>
     private void OnSessionEnded()
     {
         AppLog.Write("MirrorWindow: sessione di mirroring terminata, chiudo la finestra");
+        _ended = true;
+        try { _closed.Cancel(); } catch { }
         DispatcherQueue.TryEnqueue(() =>
         {
             _closingBecauseSessionEnded = true;
@@ -105,43 +146,36 @@ public sealed partial class MirrorWindow : Window
         });
     }
 
-    /// <summary>Whether <see cref="Closed"/> should also ask the RTSP connection to close (a real, user-initiated close) or not (this window's own session already ended on its own).</summary>
     public bool ShouldRequestSessionClose => !_closingBecauseSessionEnded;
+
+    // ---- video config (SPS/PPS): size the window, start the pipeline once ------------
 
     private void OnConfigReceived(byte[] sps, byte[] pps)
     {
         AppLog.Write($"MirrorWindow.OnConfigReceived: SPS {sps.Length} byte, PPS {pps.Length} byte");
-        if (_configured) return; // one MediaStreamSource per window/session — a re-SETUP mid-session isn't handled here
+        if (_configured) return;
         _configured = true;
 
-        if (!H264Sps.TryParseDimensions(sps, out int width, out int height))
-        {
-            // Common-case parser (see H264Sps's doc comment) didn't recognize this SPS shape —
-            // fall back to a size that still lets the pipeline negotiate the real one from the stream itself.
-            AppLog.Write("  H264Sps non ha riconosciuto questa SPS — uso il fallback 1920x1080");
-            width = 1920;
-            height = 1080;
-        }
+        if (H264Sps.TryParseDimensions(sps, out int width, out int height))
+            AppLog.Write($"  Dimensioni vere lette dalla SPS: {width}x{height}");
         else
         {
-            AppLog.Write($"  Dimensioni vere lette dalla SPS: {width}x{height}");
+            AppLog.Write("  H264Sps non ha riconosciuto questa SPS — fallback 1920x1080 (il decoder negozierà la dimensione vera)");
+            width = 1920; height = 1080;
         }
+        _videoWidth = width;
+        _videoHeight = height;
 
         DispatcherQueue.TryEnqueue(() =>
         {
             try
             {
                 ResizeToVideo(width, height);
-                // AppWindow.Resize is a Win32-level HWND resize — force XAML's own layout
-                // pass to catch up synchronously before any real frame starts flowing,
-                // rather than trusting it happens before Player's SwapChainPanel gets its
-                // first frame on its own schedule. Cheap insurance against exactly the kind
-                // of "video renders tiny, anchored top-left, at whatever size the window
-                // was before this resize" symptom a live session hit.
                 (Content as FrameworkElement)?.UpdateLayout();
-                AppLog.Write($"  Player.ActualSize dopo UpdateLayout: {Player.ActualWidth}x{Player.ActualHeight}");
-                StartPipeline(width, height, sps, pps);
-                AppLog.Write("  Pipeline avviata, finestra attivata");
+                EnsureSwapChain(width, height);
+                StartDecodePipeline(width, height);
+                Activate();
+                AppLog.Write("  Pipeline di decodifica avviata, finestra attivata");
             }
             catch (Exception ex)
             {
@@ -159,11 +193,7 @@ public sealed partial class MirrorWindow : Window
             AppWindow appWindow = AppWindow.GetFromWindowId(windowId);
 
             // AppWindow.Resize sets the OUTER window size (title bar + borders included),
-            // not the client area the video actually renders into — confirmed live:
-            // asking for 666x1440 left a ClientSize of 650x1401, ~16x39px short. Resize
-            // once to measure the real non-client overhead, then correct for it, so the
-            // video (Stretch="Uniform") doesn't end up letterboxed against a client area
-            // whose aspect ratio doesn't quite match the stream's.
+            // not the client area — measure the non-client overhead once, then correct.
             appWindow.Resize(new Windows.Graphics.SizeInt32(width, height));
             int deltaW = width - appWindow.ClientSize.Width;
             int deltaH = height - appWindow.ClientSize.Height;
@@ -172,225 +202,206 @@ public sealed partial class MirrorWindow : Window
 
             AppLog.Write($"  ResizeToVideo({width}x{height}) -> ClientSize effettivo: {appWindow.ClientSize.Width}x{appWindow.ClientSize.Height}");
         }
-        catch (Exception ex) { AppLog.Write($"  ResizeToVideo fallito: {ex}"); /* non-fatal — window just keeps its default size */ }
+        catch (Exception ex) { AppLog.Write($"  ResizeToVideo fallito: {ex}"); }
     }
 
-    private void StartPipeline(int width, int height, byte[] sps, byte[] pps)
+    private void EnsureSwapChain(int width, int height)
     {
-        // See the field's own doc comment: this must reflect when playback actually starts,
-        // not when the window was constructed.
-        _streamStart = DateTime.UtcNow;
-        _lastTimestampTicks = -1;
-        _lastSampleDeliveryUtc = null;
+        if (width <= 0 || height <= 0) { width = 1920; height = 1080; }
 
-        // Diagnostic for a live symptom: video rendering tiny (anchored top-left, whatever
-        // the window's un-resized default size was) instead of filling the real, correctly-
-        // resized window — logs Player's actual XAML-layout size whenever it changes, to
-        // tell apart "the layout pass never caught up with the resize" from "the video
-        // surface itself is the wrong size for some other reason".
-        Player.SizeChanged += (_, args) =>
-            AppLog.Write($"  Player.SizeChanged: {args.PreviousSize.Width}x{args.PreviousSize.Height} -> {args.NewSize.Width}x{args.NewSize.Height}");
-
-        // NOT setting Width/Height here: confirmed against the real docs (MS
-        // Learn, VideoEncodingProperties class remarks) that "properties that
-        // are manually set are ignored" for an instance returned by a preset
-        // factory like CreateH264() — width/height end up decided by the
-        // decoder from the real SPS in the stream regardless, the same way a
-        // real elementary-stream consumer (FFmpegInteropX's H264 system-decoder
-        // path, checked before writing this) also never sets them here. The
-        // window itself is still sized correctly, from H264Sps — see ResizeToVideo.
-        VideoEncodingProperties videoProps = VideoEncodingProperties.CreateH264();
-        // Tried AVCC (length-prefixed NALs) + SetFormatUserData here instead of Annex-B —
-        // made things categorically worse (MediaOpened never even fired; before, it always
-        // did). CreateH264()'s preset is tied to Annex-B regardless of SetFormatUserData —
-        // confirmed live, not guessed twice. Back to Annex-B: start codes, SPS/PPS as
-        // in-band samples (see EnqueueSample calls below and in StartPipeline's caller).
-
-        var descriptor = new VideoStreamDescriptor(videoProps);
-        var mss = new MediaStreamSource(descriptor)
+        if (_swapPanel is null)
         {
-            BufferTime = TimeSpan.Zero, // real-time mirroring: never intentionally add latency
-            IsLive = true,
-            // Never set before now — confirmed against a real Microsoft-documented live-
-            // streaming MediaStreamSource setup (Q&A: "How to optimize MediaElement for
-            // live streaming") that this is required alongside IsLive. Left at its default
-            // (true), the pipeline can treat an unboundedly-growing live stream as a finite,
-            // seekable timeline — a real candidate for exactly the failure this hit: it
-            // renders whatever arrived within its (undocumented, ~3s per that same source —
-            // MediaPlayerElement is noted to ignore BufferTime) initial buffering window,
-            // then never resumes because its own bookkeeping for "how much of the seekable
-            // timeline is buffered" doesn't fit a stream that isn't actually seekable at all.
-            CanSeek = false,
-        };
-        mss.Starting += (_, args) => args.Request.SetActualStartPosition(TimeSpan.Zero);
-        mss.SampleRequested += OnSampleRequested;
-        mss.Closed += (_, args) => AppLog.Write($"  MediaStreamSource.Closed: {args.Request.Reason}");
-        _mss = mss;
+            _swapPanel = new CanvasSwapChainPanel
+            {
+                HorizontalAlignment = Microsoft.UI.Xaml.HorizontalAlignment.Stretch,
+                VerticalAlignment = Microsoft.UI.Xaml.VerticalAlignment.Stretch,
+            };
+            RootGrid.Children.Add(_swapPanel);
+        }
 
-        var player = new MediaPlayer
+        if (_swapChain is not null && _surfaceWidth == width && _surfaceHeight == height) return;
+
+        CanvasDevice device = _canvasDevice ??= CanvasDevice.GetSharedDevice();
+        lock (_renderGate)
         {
-            Source = MediaSource.CreateFromMediaStreamSource(mss),
-            // Documented specifically for this scenario (live/low-latency streaming, not
-            // file playback): "changes the internal update logic to place higher emphasis
-            // on video refresh from available samples" — directly relevant to a live freeze
-            // where samples kept arriving and being handed over but the displayed frame
-            // stopped updating.
-            RealTimePlayback = true,
+            CanvasSwapChain? oldChain = _swapChain;
+            CanvasRenderTarget? oldTarget = _renderTarget;
+            _swapChain = new CanvasSwapChain(device, width, height, 96f,
+                DirectXPixelFormat.B8G8R8A8UIntNormalized, 2, CanvasAlphaMode.Ignore);
+            _renderTarget = new CanvasRenderTarget(device, width, height, 96f);
+            _surfaceWidth = width;
+            _surfaceHeight = height;
+            _swapPanel.SwapChain = _swapChain;
+            try { oldChain?.Dispose(); } catch { }
+            try { oldTarget?.Dispose(); } catch { }
+        }
+    }
+
+    // ---- decode thread -------------------------------------------------------------
+
+    private void StartDecodePipeline(int width, int height)
+    {
+        _lastDecodedUtc = DateTime.UtcNow;
+        _lastFrameShownUtc = DateTime.UtcNow;
+        // Media Foundation MFTs want one dedicated MTA thread — create + drive the
+        // decoder entirely on it, with a blocking wait (no async continuation hopping
+        // threadpool threads).
+        _decodeThread = new Thread(() => DecodeLoop(width, height))
+        {
+            IsBackground = true,
+            Name = "H264Decode",
         };
-        _player = player;
-        player.MediaFailed += (_, args) => AppLog.Write($"  MediaPlayer.MediaFailed: {args.Error} / {args.ErrorMessage} (0x{args.ExtendedErrorCode?.HResult:X8})");
-        player.MediaOpened += (_, _) => AppLog.Write("  MediaPlayer.MediaOpened (il decoder ha accettato lo stream)");
-        player.CurrentStateChanged += (sender, _) => AppLog.Write($"  MediaPlayer.CurrentStateChanged: {sender.CurrentState}");
-        // The dimensions the decoder itself actually negotiated from the real SPS —
-        // compared against the {width}x{height} H264Sps computed and what ResizeToVideo
-        // logged, this is what tells us whether a tiny/garbled render is a decoder-geometry
-        // mismatch or something else entirely (corruption inside the frame data itself).
-        player.PlaybackSession.NaturalVideoSizeChanged += (session, _) =>
-            AppLog.Write($"  NaturalVideoSizeChanged: {session.NaturalVideoWidth}x{session.NaturalVideoHeight} (atteso da SPS: {width}x{height})");
-        Player.SetMediaPlayer(player);
-
-        // Confirmed live tonight: a MediaPlayer created by hand and attached
-        // via SetMediaPlayer (rather than MediaPlayerElement's own default
-        // instance) does NOT autoplay on MediaOpened — CurrentStateChanged sat
-        // at Paused for an entire real session, video never once rendered
-        // (black window) despite MediaOpened firing with no error. An explicit
-        // Play() is required.
-        player.Play();
-
-        // The very first samples the pipeline sees: SPS then PPS, each its own Annex-B sample.
-        EnqueueSample(sps);
-        EnqueueSample(pps);
-
-        Activate();
+        _decodeThread.SetApartmentState(ApartmentState.MTA);
+        _decodeThread.Start();
+        StartWatchdog();
     }
 
-    private int _nalCount;
-
-    private void OnNalReceived(byte[] nal, bool isIdr)
+    private void DecodeLoop(int width, int height)
     {
-        // Throttled: thousands of these arrive per session, only the first few
-        // are useful to confirm NALs are actually reaching the sample queue.
-        if (Interlocked.Increment(ref _nalCount) <= 5)
-            AppLog.Write($"  NAL #{_nalCount}: {nal.Length} byte, isIdr={isIdr}");
-        EnqueueSample(nal);
-    }
-
-    private static readonly byte[] AnnexBStartCode = [0x00, 0x00, 0x00, 0x01];
-
-    private void EnqueueSample(byte[] nal)
-    {
-        var buf = new byte[AnnexBStartCode.Length + nal.Length];
-        AnnexBStartCode.CopyTo(buf, 0);
-        nal.CopyTo(buf, AnnexBStartCode.Length);
-        _samples.Writer.TryWrite(buf);
-    }
-
-    // MediaStreamSource can call SampleRequested again before an earlier call's deferral
-    // completes (read-ahead buffering) — without serializing them, two concurrent requests
-    // each independently racing to read _samples can complete (and so hand back a decoded
-    // sample) out of request order. That silently scrambles which NAL lands in which
-    // presentation slot — a real, confirmed live cause of exactly the failure this hit:
-    // structurally-correct-but-corrupted (chroma-fringed) video that then froze solid with
-    // no error anywhere, matching a scrambled P-frame poisoning the decoder's reference
-    // frame, with everything after inheriting the corruption. This gate makes requests
-    // serviced strictly in arrival order — only one channel-read-and-assign in flight ever.
-    private readonly SemaphoreSlim _sampleGate = new(1, 1);
-    private int _samplesServed;
-
-    // DateTime.UtcNow's real resolution on Windows is ~15ms, not the millisecond precision
-    // it prints — a live log showed several consecutive samples (SPS/PPS plus the first
-    // couple of NALs, delivered near-instantly since the channel already had them queued)
-    // landing on the EXACT SAME timestamp. If the decoder requires strictly increasing PTS,
-    // duplicates are a plausible way to silently wedge it — no error, just stops advancing,
-    // matching a live freeze (data kept flowing the whole time, confirmed via the counter
-    // above; only the displayed frame stopped changing). Guarded by _sampleGate already
-    // being held for the whole critical section below, so no extra locking needed here.
-    private long _lastTimestampTicks = -1;
-
-    // Real, measured gap since the previous sample was handed over — NOT a flat assumed
-    // frame rate. NALs arrive in network bursts (confirmed live: several landing within the
-    // same millisecond), so a fixed ~33ms Duration on every one of them makes their SUMMED
-    // declared duration run far ahead of how much real wall-clock time actually elapsed —
-    // exactly the kind of bookkeeping a buffering engine that tracks "how much have I got
-    // queued" by summing Duration would use to (wrongly, early) decide it's buffered far
-    // enough ahead and can stop pulling more. A backward-looking, measured duration keeps
-    // that sum honest against real time regardless of how bursty delivery actually is.
-    private DateTime? _lastSampleDeliveryUtc;
-
-    private void OnSampleRequested(MediaStreamSource sender, MediaStreamSourceSampleRequestedEventArgs args)
-    {
-        MediaStreamSourceSampleRequestDeferral deferral = args.Request.GetDeferral();
-        _ = ServiceSampleRequestAsync(args, deferral);
-    }
-
-    private async Task ServiceSampleRequestAsync(MediaStreamSourceSampleRequestedEventArgs args, MediaStreamSourceSampleRequestDeferral deferral)
-    {
-        await _sampleGate.WaitAsync().ConfigureAwait(false);
+        H264Mft decoder;
         try
         {
-            byte[] nalWithStartCode = await _samples.Reader.ReadAsync().AsTask().ConfigureAwait(false);
-            IBuffer buffer = nalWithStartCode.AsBuffer();
-
-            DateTime nowUtc = DateTime.UtcNow;
-            long ticks = (nowUtc - _streamStart).Ticks;
-            if (ticks <= _lastTimestampTicks) ticks = _lastTimestampTicks + 1; // strictly increasing, never equal or earlier
-            _lastTimestampTicks = ticks;
-            TimeSpan timestamp = TimeSpan.FromTicks(ticks);
-
-            // Measured gap since the last sample, clamped to a sane range: near-0 for a
-            // burst (several NALs delivered within the same millisecond — don't claim each
-            // one occupies a full frame's worth of time, that's the overselling this
-            // replaced) and capped for the very first sample or after any real stall
-            // (don't let one long gap claim an implausibly huge duration either).
-            TimeSpan duration = _lastSampleDeliveryUtc is { } last
-                ? nowUtc - last
-                : TimeSpan.FromMilliseconds(33); // nothing to measure yet — first sample only
-            if (duration < TimeSpan.FromMilliseconds(1)) duration = TimeSpan.FromMilliseconds(1);
-            if (duration > TimeSpan.FromMilliseconds(100)) duration = TimeSpan.FromMilliseconds(100);
-            _lastSampleDeliveryUtc = nowUtc;
-
-            MediaStreamSample sample = MediaStreamSample.CreateFromBuffer(buffer, timestamp);
-            sample.Duration = duration;
-            args.Request.Sample = sample;
-
-            // Throttled: confirms whether MediaStreamSource keeps pulling samples at all —
-            // a live freeze showed zero errors anywhere, so "did it stop asking" vs.
-            // "asked but something else stalled" was otherwise impossible to tell apart.
-            int served = Interlocked.Increment(ref _samplesServed);
-            if (served <= 10 || served % 150 == 0)
-                AppLog.Write($"  OnSampleRequested: campione #{served} consegnato ({nalWithStartCode.Length} byte)");
+            decoder = new H264Mft(width, height);
+            decoder.FrameDecoded += OnDecodedFrame;
+            _decoder = decoder;
+            AppLog.Write($"  H264Mft pronto: coded->display {decoder.DisplayW}x{decoder.DisplayH}");
         }
         catch (Exception ex)
         {
-            // Channel closed (window disposed) or a transient buffer failure — the pipeline
-            // just waits for the next SampleRequested rather than tearing down the whole player.
-            // Logged (not just swallowed) — this used to hide the real cause of any failure here.
-            AppLog.Write($"  OnSampleRequested fallito: {ex}");
+            AppLog.Write($"  H264Mft non creato: {ex}");
+            return;
+        }
+
+        try
+        {
+            while (!_closed.IsCancellationRequested)
+            {
+                try { _framesAvailable.Wait(_closed.Token); }
+                catch (OperationCanceledException) { break; }
+
+                QueuedSample s;
+                lock (_queueGate)
+                {
+                    if (_queue.Count == 0) continue;
+                    s = _queue.Dequeue();
+                }
+
+                try { decoder.Decode(s.AnnexB, s.Pts.Ticks); }
+                catch (Exception ex) { AppLog.Write($"  decode fallito: {ex.Message}"); }
+            }
         }
         finally
         {
-            _sampleGate.Release();
-            deferral.Complete();
+            try { decoder.Dispose(); } catch { }
+            _decoder = null;
         }
     }
 
-    /// <summary>Detaches from the receiver's events and stops feeding the pipeline — call when the mirroring session ends.</summary>
-    public void Detach(MirroringDataReceiver receiver)
+    /// <summary>Called from the decode thread, once per decoded frame — blit BGRA onto the swap chain.</summary>
+    private void OnDecodedFrame(byte[] bgra, int w, int h, long ptsHns)
     {
-        receiver.ConfigReceived -= OnConfigReceived;
-        receiver.NalReceived -= OnNalReceived;
-        receiver.SessionEnded -= OnSessionEnded;
-        _samples.Writer.TryComplete();
+        _lastDecodedUtc = DateTime.UtcNow;
+        int decoded = Interlocked.Increment(ref _framesDecoded);
+        if (_ended) return;
 
-        // Never disposed before — across many mirroring attempts in the same running app
-        // process (exactly what real usage AND every one of tonight's test cycles look
-        // like), each left its hardware H.264 decoder session behind for the GC to
-        // eventually finalize on its own schedule, not promptly. A very plausible source
-        // of the non-determinism actually observed live: an identical setup rendering
-        // perfectly once and corrupted-and-frozen the next, with nothing else different.
-        try { _player?.Pause(); } catch { /* already gone, or never got far enough to matter */ }
-        try { _player?.Dispose(); } catch { }
-        _player = null;
-        _mss = null;
+        try
+        {
+            lock (_renderGate)
+            {
+                CanvasSwapChain? chain = _swapChain;
+                CanvasRenderTarget? target = _renderTarget;
+                if (chain is null || target is null) return;
+
+                if ((int)target.SizeInPixels.Width != w || (int)target.SizeInPixels.Height != h)
+                {
+                    // decoder's real size differs from the surface — resize on the UI thread and skip this frame.
+                    DispatcherQueue.TryEnqueue(() => { try { EnsureSwapChain(w, h); } catch (Exception ex) { AppLog.Write($"  resize surface fallito: {ex}"); } });
+                    return;
+                }
+
+                target.SetPixelBytes(bgra);
+                using (CanvasDrawingSession ds = chain.CreateDrawingSession(Microsoft.UI.Colors.Black))
+                    ds.DrawImage(target);
+                chain.Present(0);
+            }
+
+            _lastFrameShownUtc = DateTime.UtcNow;
+            long shown = Interlocked.Increment(ref _framesShown);
+            if (shown <= 12 || shown % 600 == 0)
+                AppLog.Write($"  frame mostrato #{shown} (decodificati {decoded}, {w}x{h}, pts {ptsHns / 10_000}ms)");
+        }
+        catch (Exception ex)
+        {
+            AppLog.Write($"  blit fallito: {ex}");
+        }
+    }
+
+    private void TearDownDecoder()
+    {
+        try { _watchdog?.Stop(); } catch { }
+        try { _decodeThread?.Join(TimeSpan.FromSeconds(1)); } catch { }
+        _decodeThread = null;
+    }
+
+    // ---- frame intake (receiver thread) ------------------------------------------
+
+    private void OnFrameReceived(MirroringVideoFrame frame)
+    {
+        if (_ended) return;
+
+        bool overCap;
+        lock (_queueGate)
+        {
+            _firstTimestampNs ??= frame.TimestampNs;
+            ulong deltaNs = frame.TimestampNs >= _firstTimestampNs.Value ? frame.TimestampNs - _firstTimestampNs.Value : 0;
+            long ptsTicks = (long)(deltaNs / 100UL); // 100ns per tick
+
+            // Guard a non-monotonic / glitched encoder timestamp.
+            if (ptsTicks <= _lastPtsTicks || (_lastPtsTicks >= 0 && ptsTicks - _lastPtsTicks > 20_000_000))
+                ptsTicks = _lastPtsTicks < 0 ? 0 : _lastPtsTicks + 166_667;
+            long prevTicks = _lastPtsTicks;
+            _lastPtsTicks = ptsTicks;
+
+            _queue.Enqueue(new QueuedSample(frame.AnnexB, TimeSpan.FromTicks(ptsTicks), frame.IsKeyFrame));
+            _framesAvailable.Release();
+
+            int n = ++_framesIn;
+            if (n <= 12)
+                AppLog.Write($"  frame #{n} in ingresso: +{(prevTicks < 0 ? 0 : (ptsTicks - prevTicks) / 10_000.0):F1}ms, {frame.AnnexB.Length}B, key={frame.IsKeyFrame}");
+
+            overCap = _queue.Count > HardCapFrames;
+        }
+
+        if (overCap && !_forcedClose)
+        {
+            _forcedClose = true;
+            _ended = true;
+            try { _closed.Cancel(); } catch { }
+            AppLog.Write($"  coda oltre il limite ({HardCapFrames}) — la decodifica non tiene il passo e questo stream non ha altri IDR: chiudo la sessione");
+            DispatcherQueue.TryEnqueue(Close);
+        }
+    }
+
+    private int QueueCount() { lock (_queueGate) return _queue.Count; }
+
+    // ---- watchdog: diagnostics --------------------------------------------------
+
+    private DispatcherQueueTimer? _watchdog;
+
+    private void StartWatchdog()
+    {
+        _watchdog?.Stop();
+        _watchdog = DispatcherQueue.CreateTimer();
+        _watchdog.Interval = TimeSpan.FromSeconds(1);
+        _watchdog.Tick += Watchdog_Tick;
+        _watchdog.Start();
+    }
+
+    private void Watchdog_Tick(DispatcherQueueTimer sender, object args)
+    {
+        if (_ended) { sender.Stop(); return; }
+        double sinceDecoded = (DateTime.UtcNow - _lastDecodedUtc).TotalSeconds;
+        double sinceShown = (DateTime.UtcNow - _lastFrameShownUtc).TotalSeconds;
+        AppLog.Write($"  [watchdog] in={_framesIn} queued={QueueCount()} decoded={_framesDecoded} shown={_framesShown} ultimaDecodifica={sinceDecoded:F1}s ultimoFrame={sinceShown:F1}s");
     }
 }

@@ -10,6 +10,8 @@
     <UseWinUI>true</UseWinUI>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- H264Mft.cs's NV12->BGRA inner loop is an unsafe pointer walk. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 
     <!-- Unpackaged desktop app: no MSIX, runs as a plain .exe (simpler to build/distribute for Phase 1). -->
     <WindowsPackageType>None</WindowsPackageType>
@@ -47,6 +49,15 @@
          can't consume — 2.3.2 is the newest stable release still built for
          net9.0-windows. -->
     <PackageReference Include="H.NotifyIcon.WinUI" Version="2.3.2" />
+    <!-- Mirroring render path (see README, "La caccia al bug del rendering"):
+         Vortice.MediaFoundation drives the Windows H.264 decoder MFT directly
+         (H264Mft.cs) — MediaPlayer/MediaStreamSource around the same decoder
+         wedged solid ~1s into every live mirror stream, in both MediaPlayerElement
+         and frame-server mode. Win2D blits each decoded frame onto a
+         CanvasSwapChainPanel. 1.3.x is the Win2D branch for WindowsAppSDK 1.6;
+         Vortice.MediaFoundation is pure P/Invoke (no extra native binaries). -->
+    <PackageReference Include="Microsoft.Graphics.Win2D" Version="1.3.2" />
+    <PackageReference Include="Vortice.MediaFoundation" Version="3.6.2" />
   </ItemGroup>
 
   <ItemGroup>

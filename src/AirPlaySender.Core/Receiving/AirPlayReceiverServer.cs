@@ -32,7 +32,7 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
 
     public event Action<string>? Diagnostics;
 
-    /// <summary>Fires whenever a mirroring data receiver is stood up for a stream (proactive or client-requested) — the hook a UI uses to open a render window and subscribe to that receiver's own <see cref="MirroringDataReceiver.ConfigReceived"/>/<see cref="MirroringDataReceiver.NalReceived"/>.</summary>
+    /// <summary>Fires whenever a mirroring data receiver is stood up for a stream (proactive or client-requested) — the hook a UI uses to open a render window and subscribe to that receiver's own <see cref="MirroringDataReceiver.ConfigReceived"/>/<see cref="MirroringDataReceiver.FrameReceived"/>.</summary>
     public event Action<MirroringDataReceiver>? MirroringSessionStarted;
 
     public AirPlayReceiverServer(int port, ReceiverIdentity identity, string deviceId)
@@ -311,6 +311,25 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
             foreach (PlistValue s in streamsNode.ArrayValue)
             {
                 long type = s.Find("type")?.AsInt() ?? -1;
+
+                // Dump every field of each requested stream — the audio stream (type 96)
+                // carries the codec (ct), samples-per-frame (spf), audioFormat bitmask and
+                // sometimes a shared key (shk) we need to actually support it.
+                if (s.Type == PlistValue.Kind.Dict)
+                    foreach ((string k, PlistValue v) in s.DictValue)
+                    {
+                        string shown = v.Type switch
+                        {
+                            PlistValue.Kind.Str => v.StrValue,
+                            PlistValue.Kind.Int => v.IntValue.ToString(),
+                            PlistValue.Kind.Bool => v.BoolValue.ToString(),
+                            PlistValue.Kind.Data => $"<{v.DataValue.Length} byte: {Convert.ToHexString(v.DataValue)}>",
+                            PlistValue.Kind.Real => v.RealValue.ToString(),
+                            _ => $"<{v.Type}>",
+                        };
+                        Trace($"  stream[type={type}] campo: {k} = {shown}");
+                    }
+
                 if (type == 110) // Mirroring
                 {
                     long streamConnectionId = s.Find("streamConnectionID")?.AsInt() ?? 0;

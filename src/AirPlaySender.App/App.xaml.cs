@@ -1,4 +1,5 @@
 using AirPlaySender.Core.Receiving;
+using Microsoft.Graphics.Canvas;
 using Microsoft.UI.Xaml;
 
 namespace AirPlaySender.App;
@@ -20,6 +21,21 @@ public partial class App : Application
     public App()
     {
         InitializeComponent();
+
+        // A hard crash in a render window used to vanish with no trace in the log.
+        // Catch every last-chance path and write it before the process (or window) dies.
+        UnhandledException += (_, e) =>
+        {
+            AppLog.Write($"!!! UnhandledException (XAML): {e.Message}\n{e.Exception}");
+            // leave e.Handled=false — don't mask a real crash, just record it
+        };
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            AppLog.Write($"!!! UnhandledException (AppDomain, terminating={e.IsTerminating}): {e.ExceptionObject}");
+        System.Threading.Tasks.TaskScheduler.UnobservedTaskException += (_, e) =>
+        {
+            AppLog.Write($"!!! UnobservedTaskException: {e.Exception}");
+            e.SetObserved();
+        };
     }
 
     protected override void OnLaunched(LaunchActivatedEventArgs args)
@@ -39,6 +55,13 @@ public partial class App : Application
         }
 
         StartMirroringReceiver();
+
+        // First CanvasDevice.GetSharedDevice() (Win2D/D3D init) can take a few hundred ms.
+        // Warm it now on a background thread so it's ready before a mirroring session
+        // starts — otherwise that cost lands on the UI thread mid-connection and the
+        // render window's data receiver races ahead of it (confirmed live: window never
+        // appeared, config+IDR fired before it was listening).
+        _ = Task.Run(() => { try { CanvasDevice.GetSharedDevice(); } catch { } });
     }
 
     /// <summary>

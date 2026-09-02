@@ -10,11 +10,17 @@ AirPlay nativo per Windows, nei due versi:
   iPhone, restando raggiungibile anche in background (icona nel tray, avvio
   automatico con Windows, chiusura sincronizzata in entrambe le direzioni
   con il telefono). Pairing, cifratura e decrittazione funzionano fino in
-  fondo, verificati dal vivo ripetutamente. **Il pezzo che manca**: il
-  video si vede a schermo (a volte nitido, a volte no) ma si blocca dopo
-  pochi secondi — un bug isolato interamente nell'ultimissimo miglio del
-  rendering (vedi "La caccia al bug del rendering"), non nella cattura o
-  nella decifratura, che restano solide.
+  fondo, verificati dal vivo ripetutamente. **Il video del mirroring
+  funziona** 🎉 — immagine nitida, colori giusti, 60fps fluidi per oltre un
+  minuto senza freeze né crash, verificato dal vivo contro un iPhone 13 Pro
+  Max (iOS 26.6.1). Sia `MediaPlayerElement` sia il frame-server mode di
+  `MediaPlayer` si bloccavano dopo ~1s (bug interno a quello stack di
+  Windows, non della cattura/decifratura); lo stadio finale è stato rifatto
+  pilotando **il decoder H.264 MFT di Windows direttamente** (`H264Mft.cs`,
+  via `Vortice.MediaFoundation`) + blit su Win2D — vedi "Pipeline di
+  rendering riscritta". **Resta da fare l'audio dal telefono**: l'iPhone
+  richiede uno stream audio (`SETUP` con `type: 96`) che il ricevitore non
+  gestisce ancora.
 
 Apple non pubblica API per nessuno dei due versi su piattaforme non Apple.
 Questo progetto ricostruisce i protocolli (pairing HAP, RTSP cifrato,
@@ -563,6 +569,288 @@ buttato via: il blocco è isolato all'ultimissimo miglio (il pixel a
 schermo), non alla cattura/decifratura/instradamento del video, che
 restano la parte difficile e già risolta di questo progetto.
 
+## 🔧 Pipeline di rendering riscritta: PTS dall'encoder, access unit interi, watchdog
+
+Sessione successiva, ripartendo dalla "conclusione onesta" qui sopra —
+riletta con occhi freschi, quel "flusso dati sano al 100%" non lo era del
+tutto. Tre difetti strutturali, tutti a monte del compositor opaco, tutti
+corretti:
+
+- **Il PTS dei campioni veniva assegnato al momento della richiesta, non
+  all'arrivo del frame.** `OnSampleRequested` faceva
+  `timestamp = DateTime.UtcNow - _streamStart` *quando `MediaStreamSource`
+  chiedeva il campione*. Ogni volta che il producer correva avanti (una
+  raffica di pacchetti dalla rete, o il buffering iniziale del renderer che
+  teneva ferma la coda), decine di frame venivano tirati fuori in pochi
+  millisecondi e **timbrati tutti con lo stesso "adesso"** — la timeline di
+  presentazione collassava, il renderer si ritrovava senza margine e
+  andava in stallo. È il candidato numero uno per un blocco "dopo 1-3
+  secondi": è esattamente quanto dura il primo buffer prima che la coda
+  smetta di essere in vantaggio.
+- **Ogni NAL era un campione a sé, con timestamp proprio.** Un access unit
+  H.264 (SEI + slice, o più slice) finiva spezzato in campioni separati a
+  timestamp crescenti — il decoder non ha più un confine di frame
+  affidabile, e una volta in errore non ha modo di recuperare.
+- **SPS/PPS non veniva mai ripresentato.** Consegnati una volta sola in
+  testa allo stream. Al primo fault del decoder (un pacchetto perso, un
+  reference frame corrotto) il successivo IDR da solo non basta a
+  ripartire: servono i parameter set *in-band con lui*.
+
+**Formato header confermato leggendo il sorgente vero di UxPlay** (non i
+doc): `raop_rtp_mirror.c` legge l'**offset 8** dei 128 byte di header come
+`byteutils_get_long` — cioè uint64 **little-endian**, e `raop_ntp` lavora
+in **nanosecondi** (clock del telefono, epoca arbitraria dal boot). È il
+timestamp reale di presentazione del frame, prodotto dall'encoder,
+**jitter-free** — e non veniva mai letto.
+
+Cosa è stato costruito:
+
+- **`MirroringDataReceiver`** assembla ora **un access unit intero per
+  pacchetto video**: converte AVCC→Annex-B (sostituisce il prefisso di
+  lunghezza a 4 byte big-endian con lo start code `00 00 00 01`, la stessa
+  identica operazione del mirror thread di UxPlay), **antepone SPS/PPS a
+  ogni key frame** (stream auto-recuperante), e passa avanti il timestamp
+  del frame. I frame **prima del primo IDR vengono scartati** (un decoder
+  non può partire da un P-frame). I NAL non-VCL isolati (SEI/AUD in un
+  pacchetto senza slice) vengono agganciati al frame successivo, non
+  spediti come "frame senza immagine". Nuovo evento
+  `FrameReceived(MirroringVideoFrame)` al posto del vecchio `NalReceived`
+  per-NAL; `ConfigReceived` resta ma serve solo a dimensionare la finestra.
+- **`MirrorWindow`**: un `MediaStreamSample` per frame; **PTS preso
+  dall'encoder** (delta del timestamp di header convertito in tick, con
+  guardia: mai all'indietro, un salto di >2s è trattato come glitch del
+  clock e non come tempo reale); `Duration` = intervallo reale al frame
+  successivo (un frame di ritardo per calcolarlo esatto, invece di un
+  ~33ms fisso che con arrivi a raffica mente sul tempo trascorso);
+  `KeyFrame` impostato sul campione. **Coda limitata** (~2.5s a 60fps):
+  quando il renderer resta indietro, scarta i frame stantii **fino
+  all'ultimo key frame** — il mirroring in tempo reale deve tenere bassa
+  la latenza, e un resync pulito a un IDR batte un backlog che cresce.
+- **Watchdog** (1 Hz): se la posizione di playback smette di avanzare per
+  >3s mentre in coda ci sono frame decodificabili e siamo ben oltre
+  l'avvio, **ricostruisce la pipeline** (`MediaPlayer`/`MediaStreamSource`
+  nuovi) e riparte da un key frame, mantenendo **un'unica timeline PTS
+  continua** attraverso la ricostruzione. Fino a 6 volte, poi si ferma e
+  logga: se anche una pipeline nuova di zecca resta bloccata, il colpevole
+  è il compositor di `MediaPlayerElement` e il fix strutturale è il
+  frame-server mode (vedi sotto). Ogni tick logga
+  `served`/`queued`/`pos`/stato — così il prossimo test dal vivo dice
+  **con certezza** se `MediaStreamSource` smette di chiedere campioni
+  (scenario A) o se continua a chiederli ma il fotogramma non cambia
+  (scenario B): una distinzione che finora nessun log permetteva di fare.
+
+**Verificato**: build App pulita (0 warning), test verdi —
+`MirroringDataReceiverVideoTests` guida un `MirroringDataReceiver` vero su
+una connessione TCP di loopback con pacchetti mirroring costruiti a mano
+(header da 128 byte, payload video cifrato AES-CTR con keystream continuo,
+record di config in chiaro) e verifica: assemblaggio Annex-B byte-per-byte,
+SPS/PPS anteposto agli IDR, timestamp letto e convertito da offset 8,
+scarto dei frame prima del primo IDR. Segue il primo test dal vivo — vedi
+sotto.
+
+**Onestà**: questa prima versione teneva ancora `MediaPlayerElement` per la
+composizione. I due test dal vivo qui sotto hanno mostrato che è proprio lì
+il blocco — e la sezione "Frame-server mode + Win2D" lo toglie di mezzo.
+
+### Primo test dal vivo della pipeline nuova: due difetti trovati nei log
+
+Il log del watchdog ha reso la sessione **conclusiva** — cosa che nessun
+test precedente permetteva. Due bug, entrambi corretti:
+
+- **La scala del timestamp era sbagliata di 4.29x.** L'offset 8 dell'header
+  mirroring non è un contatore di nanosecondi grezzo: è un timestamp **NTP
+  a virgola fissa 32.32** (secondi nei 32 bit alti, frazione scalata a 2^32
+  nei bassi). Letto come nanosecondi diretti, ogni frame risultava distante
+  ~72ms dal precedente invece di ~16.6ms → il renderer riproduceva lo
+  stream a **~14fps mentre ne arrivavano ~60**, la coda si riempiva a
+  35 frame/s. Corretto con `Ntp.ToNanoseconds` (identico a
+  `raop_ntp_timestamp_to_nano_seconds` di UxPlay:
+  `ns = sec*1e9 + (frac*1e9 >> 32)`), letto dal sorgente vero e verificato
+  con vettori calcolati a mano.
+- **Lo stream ha un solo IDR.** In tutta la sessione (~900 pacchetti, 25
+  secondi) l'iPhone ha mandato **un solo key frame**, all'inizio, e poi
+  solo P-frame. Su TCP affidabile va benissimo — ma significa che
+  **scartare anche un solo frame rende tutti i successivi non
+  decodificabili** finché il telefono non manda un altro IDR di sua
+  iniziativa (un cambio di scena, un cambio app), che può non arrivare per
+  decine di secondi. La logica "coda limitata, scarta fino all'ultimo key
+  frame" della prima versione era quindi attivamente dannosa: appena la
+  coda si riempiva (per via del bug del timestamp), scartava P-frame e
+  mandava in crisi il decoder — ed è **esattamente** il punto in cui nel
+  log `served` si è congelato a 72 mentre `pos` continuava ad avanzare
+  (schermo fermo, contatore che scorre). Ora la coda **non viene mai
+  potata** in funzionamento normale: consegna ogni frame in ordine. Il
+  `SampleRequested` non fa più polling ma si blocca su un semaforo. Resta
+  solo un tetto di sicurezza (~15s di frame): se lo si supera, la pipeline
+  di rendering ha davvero ceduto e — non essendoci un IDR a cui
+  riagganciarsi — la mossa onesta è chiudere la sessione perché l'utente ne
+  faccia ripartire una pulita.
+
+Con la scala del timestamp giusta, il renderer riproduce a 60fps ≈ la
+velocità di arrivo, la coda resta vicina a zero, e non si scarta nulla.
+
+### Secondo test dal vivo: il flusso dati è perfetto, ma il compositor si blocca lo stesso
+
+Log della sessione con i due fix sopra: **impeccabile**. Passo tra i frame
++16.7 / +33.3ms (60 e 30fps veri), `queued=0` per tutti i 25 secondi,
+`served` che insegue `in` frame per frame (1100/1101 a fine sessione),
+`pos` che avanza in tempo reale, zero scarti, zero rebuild, chiusura
+pulita. Risoluzione 666×1440, `NaturalVideoSizeChanged` che combacia con la
+SPS.
+
+E però: **l'utente vede l'immagine perfetta e nitida per ~1 secondo, poi si
+blocca del tutto e non riparte più.** Niente `MediaFailed`, `served` che
+continua a salire, `pos` che avanza: la pipeline dati è sana al 100%, sono
+i *pixel* che si fermano. È il compositor di `MediaPlayerElement` (lo swap
+chain separato che Windows disegna sotto la UI) che si incastra — lo stesso
+vicolo cieco di MixedReality-WebRTC, e a questo punto **provato sul serio,
+non solo temuto**: il rumore di rendering (bitrate basso, colori sballati)
+è sparito del tutto, quindi decodifica e instradamento sono corretti; resta
+solo l'ultimo stadio.
+
+### Frame-server mode + Win2D (fatto, da verificare dal vivo)
+
+Rifatto lo stadio finale come previsto: **`MediaPlayer` in frame-server
+mode** (`IsVideoFrameServerEnabled`) — `MediaStreamSource` decodifica
+esattamente come prima (parte provata sana), ma invece di lasciare che
+`MediaPlayerElement` componga il video, ogni frame decodificato arriva
+nell'evento `VideoFrameAvailable` e viene copiato **a mano** su un
+`CanvasSwapChainPanel` di Win2D (`CopyFrameToVideoSurface` →
+`CanvasRenderTarget` → `DrawImage` → `Present(0)`). Nessun
+`MediaPlayerElement` nella finestra: la superficie è nostra, quindi un
+compositore che si rifiuta di presentare non può più bloccarci.
+
+- `MirrorWindow.xaml` non ha più `MediaPlayerElement`, solo un `Grid` in
+  cui il code-behind inserisce il `CanvasSwapChainPanel`.
+- `Present(0)` (sync interval 0): il callback `VideoFrameAvailable` non
+  aspetta mai il vsync — un handler bloccato è proprio ciò da cui si
+  scappa; si accetta un raro tearing.
+- Swap chain e blit target sono legati al device, non al player: si tengono
+  tra un rebuild e l'altro, si ricreano solo se cambia la risoluzione
+  (`NaturalVideoSizeChanged`).
+- Il **watchdog** ora guarda la cosa giusta — se `VideoFrameAvailable`
+  smette di scattare (`shown` fermo) mentre il decoder è ancora alimentato
+  (`served` che sale) — invece di dedurre la vita dal clock di playback, che
+  avanzava anche a compositor congelato.
+- Nuova dipendenza: `Microsoft.Graphics.Win2D` 1.3.2 (il ramo per
+  WindowsAppSDK 1.6).
+
+### La finestra non appariva più: corsa tra creazione finestra e dati
+
+Primo test del frame-server: **la MirrorWindow non è comparsa affatto**. Il
+log lo spiega: la finestra di rendering si crea sul thread UI, un salto di
+dispatcher *dopo* che il `MirroringDataReceiver` sta già leggendo i
+pacchetti — e la prima inizializzazione di `CanvasDevice` (Win2D/D3D) fa
+durare quel salto qualche centinaio di ms. In quella finestra temporale il
+pacchetto di config **e l'unico IDR della sessione** venivano emessi nel
+vuoto (nessun iscritto), poi `MirrorWindow.Attach` si agganciava troppo
+tardi: `OnConfigReceived` non scattava mai → niente pipeline, niente
+`Activate()`, finestra invisibile.
+
+Corretto in tre modi:
+- **`MirroringDataReceiver` ora ricorda** l'ultimo config e tutti i frame
+  dall'ultimo key frame (`EmitConfig`/`EmitFrame`/`EmitSessionEnded` sotto
+  un lock). `AttachRenderer(onConfig, onFrame, onEnded)` iscrive il renderer
+  **e** gli ripassa il backlog in un colpo solo, atomico: un frame che
+  arriva durante l'aggancio viene consegnato dal vivo subito dopo, senza
+  buchi né doppioni. Se la sessione è già finita, chiama subito `onEnded`
+  (così la finestra "fantasma" dell'offerta proattiva si chiude da sola
+  invece di restare orfana).
+- **`CanvasDevice` creato pigramente** (non nel costruttore della finestra)
+  e **pre-scaldato** all'avvio dell'app su un thread di sfondo, così il
+  costo non cade più sul thread UI a metà connessione.
+- Il watchdog logga `shown` (i frame che arrivano davvero a schermo via
+  `VideoFrameAvailable`), per distinguere "il compositor si blocca" da "il
+  decoder si blocca".
+
+Con questi fix la finestra è comparsa e l'immagine era **nitida** — ma
+sempre bloccata dopo ~1s. Il log ha reso la cosa definitiva: in
+frame-server mode `VideoFrameAvailable` scatta **esattamente 4 volte**
+(22:34:05.685→06.564) e poi mai più, mentre `served` sale a 764, `pos`
+avanza a 15s, `state=Playing`, zero errori. Il compositor era già
+bypassato: **il blocco è dentro `MediaPlayer` / Media Foundation stesso** —
+il decoder viene alimentato ma smette di produrre fotogrammi.
+
+### MFT H.264 pilotato direttamente — la soluzione
+
+Tolto del tutto `MediaPlayer` e `MediaStreamSource`. Nuovo `H264Mft.cs`:
+parla direttamente al **decoder H.264 MFT di Windows**
+(`CLSID_CMSH264DecoderMFT`, via `Vortice.MediaFoundation`) con un loop
+esplicito `ProcessInput`/`ProcessOutput` — nessun clock nascosto, nessuna
+euristica di buffering, nessuna assunzione sul riordino dei fotogrammi.
+
+- `MF_LOW_LATENCY` impostato sul MFT: senza, il decoder bufferizza ~30
+  frame prima del primo output (probabilmente parte di ciò che si vedeva
+  come "4 frame poi niente" via `MediaPlayer`).
+- Un frame Annex-B intero entra, esce NV12 → convertito a BGRA
+  (BT.709 limited, loop unsafe) → blit sulla `CanvasSwapChainPanel` Win2D
+  già presente, `Present(0)`.
+- Thread dedicato **MTA** per tutte le chiamate MF, con attesa bloccante
+  (niente continuazioni async che saltano tra thread del pool).
+- `H264Sps` fornisce la dimensione di partenza; il decoder rinegozia
+  (`MF_E_TRANSFORM_STREAM_CHANGE`) e si legge la geometria vera.
+- Watchdog: logga `decoded` (fotogrammi usciti dal MFT) vs `shown`
+  (fotogrammi blittati) — così si distingue un blocco nel decoder da uno
+  nel blit.
+- Dipendenza nuova: `Vortice.MediaFoundation` 3.6.2 (P/Invoke puro su
+  `mfplat.dll`/`ole32.dll`, nessun binario nativo in più).
+
+### Primo test del MFT diretto: FUNZIONA, poi un crash da double-free
+
+Il log è netto: `decoded` e `shown` inseguono `in` a **60fps veri**,
+`queued=0`, per ~10 secondi filati (`in=422 decoded=416 shown=416`,
+`ultimaDecodifica=0.0s` sempre) — **niente più blocco**. Poi il log si
+interrompe di colpo: nessun errore, nessun teardown, la finestra sparisce
+ma il processo e la connessione RTSP restano vivi. Crash nativo secco.
+
+Causa trovata: **double-free COM** in `H264Mft.DrainOutputs`. Dopo
+`ProcessOutput` con un `MFT_OUTPUT_DATA_BUFFER` che gli abbiamo fornito
+noi, Vortice/SharpGen ricostruisce `db.Sample` come wrapper managed nuovo
+sullo **stesso** puntatore nativo di `ours`, **senza `AddRef`**
+(`__MarshalFrom` di struct). Il codice faceva `produced.Dispose()` +
+`ours.Dispose()` → doppio `Release` sullo stesso oggetto → refcount
+sotto zero → memoria liberata e riusata → heap corrotto → crash "a caso"
+qualche centinaio di frame dopo (416 ≈ 10s, combacia). Corretto: quando il
+sample lo forniamo noi, si tocca e si rilascia **solo** `ours`, mai
+`db.Sample`.
+
+Nello stesso giro, altre due strette anti-crash:
+- Niente più `CanvasBitmap.CreateFromBytes` per ogni frame (40 texture GPU
+  al secondo, allocate e distrutte) — un `CanvasRenderTarget` persistente
+  con `SetPixelBytes`. E il buffer BGRA in `H264Mft` è riusato, non
+  riallocato (3.8MB × 40/s di garbage in meno).
+- Swap chain / render target protetti da un lock contro il (raro) percorso
+  di resize che li sostituisce dal thread UI mentre il thread di decodifica
+  sta presentando.
+- `App` ora aggancia `UnhandledException` (XAML + AppDomain) e
+  `UnobservedTaskException` e li scrive nel log — un crash nativo non deve
+  più sparire senza traccia.
+
+### 🎉 Il video del mirroring funziona
+
+Test dal vivo con il double-free corretto: **oltre un minuto di mirroring
+fluido**, `in=3098 decoded=3089 shown=3089`, `queued` quasi sempre 0,
+`ultimaDecodifica=0.0s` per tutta la durata, nessun freeze, nessun crash,
+chiusura pulita quando l'utente ferma dal telefono. Immagine nitida, colori
+giusti, 666×1440 a 60fps. Il pezzo grosso della Fase 2 è fatto.
+
+### Resta: l'audio dal telefono
+
+Lo stesso log mostra l'iPhone che, a mirroring già avviato, manda una
+`SETUP` separata con `streams:[{type: 96, ...}]` — lo **stream audio
+AirPlay** — e la ritenta ogni ~2s perché il ricevitore risponde "SETUP
+stream di tipo 96 non supportato in questa fase". Da fare: rispondere alla
+type 96 (porte UDP `dataPort`/`controlPort`), ricevere l'RTP audio,
+decifrarlo (chiave AES dalla stessa `SessionAesKey` del video + `eiv`),
+decodificare l'AAC e riprodurlo (WASAPI/AudioGraph) sincronizzato col
+video. Nodo aperto: il codec — iOS moderno usa quasi certo **AAC-ELD**, che
+il decoder AAC di Windows (`CMSAACDecMFT`) non gestisce; servirà
+`fdk-aac`/`libavcodec`. Aggiunto un dump completo dei campi di ogni stream
+nella `SETUP` (`stream[type=96] campo: ct = ...`) per vedere `ct`/`spf`/
+`audioFormat`/`shk` esatti al prossimo test.
+
+**Verificato in locale**: build App pulita (0 warning), **62/62 test**.
+
 ## Architettura
 
 ```
@@ -585,14 +873,15 @@ src/
       FairPlaySetup.cs                handshake /fp-setup (replay di byte catturati da UxPlay)
       FairPlayCipher.cs               il cifrario FairPlay vero, portato da UxPlay/OmgHax
       FairPlayCipherTables.g.cs       le sue tabelle S-box, estratte meccanicamente (non a mano)
-      MirroringDataReceiver.cs        canale dati video (TCP), framing pacchetti + decrypt, espone ConfigReceived/NalReceived
+      MirroringDataReceiver.cs        canale dati video (TCP), framing pacchetti + decrypt, assembla access unit interi (AVCC->Annex-B, SPS/PPS su ogni IDR, timestamp da header offset 8), espone ConfigReceived/FrameReceived
       AvcDecoderConfig.cs             AVCDecoderConfigurationRecord + split dei NAL AVCC
       H264Sps.cs                      parser SPS H.264 → larghezza/altezza vere
     AirPlaySession.cs      orchestratore Fase 1: connect → pair → handshake → stream
 
   AirPlaySender.App/      app WinUI 3 (finestra, lista dispositivi, dialog PIN, volume,
                            icona nel tray, MirrorWindow per il rendering del mirroring)
-    MirrorWindow.xaml(.cs)   finestra di rendering: MediaStreamSource H.264, dimensioni native
+    MirrorWindow.xaml(.cs)   finestra di rendering: coda -> H264Mft -> blit BGRA su CanvasSwapChainPanel (Win2D), dimensioni native
+    H264Mft.cs               decoder H.264 MFT di Windows pilotato a mano (ProcessInput/ProcessOutput, low-latency, NV12->BGRA)
     StartupRegistration.cs   voce nella chiave Run di HKCU per l'avvio con Windows
     AppLog.cs                logger su file (mirroring.log accanto all'exe) — l'unico
                               modo di vedere i log in un'app senza console/in background
@@ -718,28 +1007,26 @@ verificati empiricamente in questo progetto:
 
 - **Fase 1.1**: provare contro più dispositivi reali (Apple TV con PIN,
   altri speaker AirPlay 2), rilevazione disconnessione, multi-room.
-- **Fase 2 (ricevitore di mirroring)**: video vero ricevuto e decifrato con
-  successo su hardware reale (quasi 2000 pacchetti, AVCC, verificato byte
-  per byte — vedi "Il video vero funziona"); pipeline di rendering
-  (`MirrorWindow`, `MediaStreamSource`), icona nel tray, chiusura
-  sincronizzata in entrambe le direzioni fra Windows e iPhone, e avvio
-  automatico con Windows tutti costruiti e testati dal vivo — vedi "La
-  caccia al bug del rendering". Resta:
-  1. **Il video si vede ma si blocca dopo pochi secondi** — il pezzo grosso
-     che manca ora. Flusso dati verificato sano al 100% (vedi sopra per
-     tutto quello già escluso); il blocco è dentro l'engine di rendering
-     di Windows, opaco da questa API. Prossimo tentativo concreto, non
-     ancora provato: il *frame-server mode* di WinRT
-     (`IsVideoFrameServerEnabled` + Win2D) per prendere i fotogrammi già
-     decodificati dall'hardware e disegnarli a mano, bypassando qualunque
-     cosa si rompa nella composizione automatica di `MediaPlayerElement`.
+- **Fase 2 (ricevitore di mirroring)**: **il video funziona** 🎉 — ricevuto,
+  decifrato, decodificato (decoder H.264 MFT di Windows pilotato a mano) e
+  reso a schermo (Win2D), 60fps fluidi per oltre un minuto dal vivo contro
+  un iPhone reale. Più icona nel tray, chiusura sincronizzata in entrambe le
+  direzioni, avvio automatico con Windows. Resta:
+  1. **L'audio dal telefono.** L'iPhone manda una `SETUP` separata con
+     `streams:[{type: 96, ...}]` (stream audio AirPlay) e la ritenta ogni
+     ~2s perché il ricevitore la rifiuta. Da fare: rispondere alla type 96
+     (porte UDP dati/controllo), ricevere l'RTP audio, decifrarlo (AES dalla
+     stessa `SessionAesKey` del video + `eiv`), decodificare l'AAC e
+     riprodurlo sincronizzato col video. Probabile **AAC-ELD**, non
+     gestito dal decoder AAC di Windows → servirà `fdk-aac`/`libavcodec`.
+     Un dump dei campi dello stream nella `SETUP` è già loggato per vedere
+     `ct`/`spf`/`audioFormat` esatti.
   2. Il pair-setup HAP "vero" (transient collegato ma probabilmente non la
-     forma corretta — vedi sopra) resta un'incognita a bassa priorità ora:
-     il percorso legacy già collegato funziona fino al video vero, quindi
-     non blocca più nulla nell'immediato.
-  3. La sessione dati (porta separata dalla 6030 vista con la TV) potrebbe
-     aver bisogno di gestire riconnessioni/più stream — non ancora
-     osservato un secondo tentativo nella stessa sessione.
+     forma corretta — vedi sopra) resta un'incognita a bassa priorità: il
+     percorso legacy già collegato funziona fino in fondo per il video.
+  3. La sessione dati potrebbe aver bisogno di gestire riconnessioni/più
+     stream — il video regge bene una sessione lunga, non ancora provate
+     riconnessioni.
 - **Fase 2b (sender di mirroring, Windows → TV)**: non affrontata, R&D
   ancora più aperta di quanto sopra — nessun progetto open source esiste per
   questo verso. Vedi la discussione nella cronologia del progetto per la

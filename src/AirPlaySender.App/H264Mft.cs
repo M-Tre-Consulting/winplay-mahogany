@@ -1,0 +1,287 @@
+using System.Runtime.InteropServices;
+using SharpGen.Runtime;
+using Vortice.MediaFoundation;
+
+namespace AirPlaySender.App;
+
+/// <summary>
+/// Drives Windows' built-in H.264 decoder Media Foundation Transform
+/// (<c>CLSID_CMSH264DecoderMFT</c>) directly — an explicit
+/// <c>ProcessInput</c>/<c>ProcessOutput</c> loop with no
+/// <see cref="Windows.Media.Playback.MediaPlayer"/> and no
+/// <see cref="Windows.Media.Core.MediaStreamSource"/> around it.
+///
+/// Why: fed this exact live iPhone-mirror stream through
+/// MediaStreamSource → MediaPlayer, the decoder stops producing output
+/// frames after ~1 second (confirmed live twice: samples keep being pulled,
+/// the playback clock keeps advancing, no error ever surfaces, but
+/// <c>VideoFrameAvailable</c> fires exactly ~4 times and then never again —
+/// even in frame-server mode, which rules out the compositor). Talking to
+/// the MFT ourselves removes every hidden clock, buffering heuristic and
+/// reorder assumption in that stack: one access unit in, decoded NV12 out,
+/// converted to BGRA here and handed to the caller to blit.
+///
+/// Input is Annex-B (start codes), SPS/PPS in-band on every key frame (see
+/// <see cref="AirPlaySender.Core.Receiving.MirroringDataReceiver"/>) — the
+/// MFT parses parameter sets straight from the bitstream.
+/// </summary>
+internal sealed class H264Mft : IDisposable
+{
+    private static readonly Guid CLSID_CMSH264DecoderMFT = new("62CE7E72-4C71-4D20-B15D-452831A87D9D");
+    private static readonly Guid IID_IMFTransform = new("BF94C121-5B05-4E6F-8000-BA598961414D");
+    private static readonly Guid MFMediaType_Video = new("73646976-0000-0010-8000-00AA00389B71");
+    private static readonly Guid MFVideoFormat_H264 = new("34363248-0000-0010-8000-00AA00389B71");
+    private static readonly Guid MFVideoFormat_NV12 = new("3231564E-0000-0010-8000-00AA00389B71");
+    // Same GUID as CODECAPI_AVLowLatencyMode; the H.264 decoder honours it as an MFT
+    // attribute. Without it the decoder buffers ~30 frames before its first output —
+    // fatal for real-time mirroring (and a plausible part of the "few frames then
+    // nothing" seen through MediaPlayer).
+    private static readonly Guid MF_LOW_LATENCY = new("9C27891A-ED7A-40E1-88E8-B22727A024EE");
+
+    private const int MF_E_TRANSFORM_NEED_MORE_INPUT = unchecked((int)0xC00D6D72);
+    private const int MF_E_TRANSFORM_STREAM_CHANGE = unchecked((int)0xC00D6D61);
+    private const int MF_E_NOTACCEPTING = unchecked((int)0xC00D36B5);
+    private const int MFT_OUTPUT_STREAM_PROVIDES_SAMPLES = 0x100;
+    private const uint MFT_ENUM_FLAG_SYNCMFT = 0x1;
+    private const int CLSCTX_INPROC_SERVER = 1;
+    private const uint MFVideoInterlace_Progressive = 2;
+
+    [DllImport("ole32.dll")]
+    private static extern int CoCreateInstance(in Guid rclsid, IntPtr pUnkOuter, uint dwClsContext, in Guid riid, out IntPtr ppv);
+
+    private readonly IMFTransform _mft;
+    private int _codedW, _codedH, _stride;
+    private bool _mfStarted;
+    // Reused across frames — the FrameDecoded handler copies it out synchronously
+    // (Win2D SetPixelBytes), so one buffer is enough and it keeps 40 * 3.8MB/s of
+    // garbage off the heap.
+    private byte[] _bgra = [];
+
+    public int DisplayW { get; private set; }
+    public int DisplayH { get; private set; }
+
+    /// <summary>Raised once per decoded frame, on the calling (decode) thread: (bgra top-down, width, height, ptsHns).</summary>
+    public event Action<byte[], int, int, long>? FrameDecoded;
+
+    public H264Mft(int displayW, int displayH)
+    {
+        DisplayW = displayW > 0 ? displayW : 1920;
+        DisplayH = displayH > 0 ? displayH : 1080;
+
+        MediaFactory.MFStartup(false).CheckError();
+        _mfStarted = true;
+
+        int hr = CoCreateInstance(in CLSID_CMSH264DecoderMFT, IntPtr.Zero, CLSCTX_INPROC_SERVER, in IID_IMFTransform, out IntPtr pMft);
+        if (hr < 0 || pMft == IntPtr.Zero) throw new InvalidOperationException($"CoCreateInstance(CMSH264DecoderMFT) 0x{hr:X8}");
+        _mft = new IMFTransform(pMft);
+
+        try { _mft.Attributes.Set(MF_LOW_LATENCY, true); } catch (SharpGenException) { /* not all builds expose it */ }
+
+        ConfigureInput();
+        NegotiateOutput();
+
+        _mft.ProcessMessage(TMessageType.MessageNotifyBeginStreaming, UIntPtr.Zero);
+        _mft.ProcessMessage(TMessageType.MessageNotifyStartOfStream, UIntPtr.Zero);
+    }
+
+    private void ConfigureInput()
+    {
+        IMFMediaType t = MediaFactory.MFCreateMediaType();
+        t.Set(MediaTypeAttributeKeys.MajorType, MFMediaType_Video);
+        t.Set(MediaTypeAttributeKeys.Subtype, MFVideoFormat_H264);
+        t.Set(MediaTypeAttributeKeys.InterlaceMode, MFVideoInterlace_Progressive);
+        t.Set(MediaTypeAttributeKeys.FrameSize, Pack(DisplayW, DisplayH));
+        t.Set(MediaTypeAttributeKeys.FrameRate, Pack(60, 1));
+        t.Set(MediaTypeAttributeKeys.PixelAspectRatio, Pack(1, 1));
+        _mft.SetInputType(0, t, 0);
+        t.Dispose();
+    }
+
+    private void NegotiateOutput()
+    {
+        for (int i = 0; ; i++)
+        {
+            IMFMediaType t;
+            try { t = _mft.GetOutputAvailableType(0, i); }
+            catch (SharpGenException) { throw new InvalidOperationException("Il decoder H.264 non offre un tipo di output NV12"); }
+
+            bool isNv12 = t.GetGUID(MediaTypeAttributeKeys.Subtype) == MFVideoFormat_NV12;
+            if (isNv12)
+            {
+                _mft.SetOutputType(0, t, 0);
+                t.Dispose();
+                ReadOutputGeometry();
+                return;
+            }
+            t.Dispose();
+        }
+    }
+
+    private void ReadOutputGeometry()
+    {
+        IMFMediaType t = _mft.GetOutputCurrentType(0);
+        ulong fs = t.GetUInt64(MediaTypeAttributeKeys.FrameSize);
+        _codedW = (int)(fs >> 32);
+        _codedH = (int)(fs & 0xFFFFFFFF);
+        try { _stride = unchecked((int)t.GetUInt32(MediaTypeAttributeKeys.DefaultStride)); } catch (SharpGenException) { _stride = _codedW; }
+        if (_stride <= 0) _stride = _codedW;
+        if (DisplayW <= 0 || DisplayW > _codedW) DisplayW = _codedW;
+        if (DisplayH <= 0 || DisplayH > _codedH) DisplayH = _codedH;
+        t.Dispose();
+    }
+
+    /// <summary>Feed one Annex-B access unit and blit out every frame it completes.</summary>
+    public void Decode(byte[] annexB, long ptsHns)
+    {
+        IMFSample sample = MediaFactory.MFCreateSample();
+        IMFMediaBuffer buffer = MediaFactory.MFCreateMemoryBuffer(annexB.Length);
+        buffer.Lock(out IntPtr p, out _, out _);
+        Marshal.Copy(annexB, 0, p, annexB.Length);
+        buffer.Unlock();
+        buffer.CurrentLength = annexB.Length;
+        sample.AddBuffer(buffer);
+        sample.SampleTime = ptsHns;
+        sample.SampleDuration = 166_667;
+
+        try
+        {
+            _mft.ProcessInput(0, sample, 0);
+        }
+        catch (SharpGenException ex) when (ex.ResultCode.Code == MF_E_NOTACCEPTING)
+        {
+            DrainOutputs();
+            _mft.ProcessInput(0, sample, 0);
+        }
+        DrainOutputs();
+
+        buffer.Dispose();
+        sample.Dispose();
+    }
+
+    private void DrainOutputs()
+    {
+        while (true)
+        {
+            // Re-read each iteration: a STREAM_CHANGE below renegotiates the output type,
+            // which changes the required buffer size.
+            OutputStreamInfo info = _mft.GetOutputStreamInfo(0);
+            bool mftAllocates = (info.Flags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) != 0;
+            int bufSize = Math.Max(info.Size, _stride * _codedH * 3 / 2 + 64);
+
+            IMFSample? ours = null;
+            IMFMediaBuffer? ourBuf = null;
+            if (!mftAllocates)
+            {
+                ours = MediaFactory.MFCreateSample();
+                ourBuf = MediaFactory.MFCreateMemoryBuffer(bufSize);
+                ours.AddBuffer(ourBuf);
+            }
+
+            var db = new OutputDataBuffer { StreamID = 0, Sample = ours! };
+            Result hr = _mft.ProcessOutput(ProcessOutputFlags.None, 1, ref db, out _);
+
+            // db.Sample after the call is a fresh managed wrapper around the SAME native
+            // pointer as `ours`, created WITHOUT an AddRef (SharpGen's struct __MarshalFrom).
+            // So it must NEVER be Disposed when we supplied the sample — doing so
+            // double-releases `ours` and corrupts the heap a few dozen frames later
+            // ("crashed a caso", window gone, no log). Only touch what we actually own:
+            // `ours` when we allocated it, or db.Sample only when the MFT allocated it.
+            if (hr.Code == MF_E_TRANSFORM_NEED_MORE_INPUT)
+            {
+                ourBuf?.Dispose();
+                ours?.Dispose();
+                return;
+            }
+            if (hr.Code == MF_E_TRANSFORM_STREAM_CHANGE)
+            {
+                ourBuf?.Dispose();
+                ours?.Dispose();
+                NegotiateOutput(); // decoder learned the real coded size — re-read it
+                continue;
+            }
+            hr.CheckError();
+
+            if (mftAllocates)
+            {
+                IMFSample produced = db.Sample;
+                try { EmitFrame(produced); } finally { produced.Dispose(); }
+            }
+            else
+            {
+                EmitFrame(ours!);
+                ourBuf!.Dispose();
+                ours!.Dispose();
+            }
+        }
+    }
+
+    private void EmitFrame(IMFSample s)
+    {
+        long pts = s.SampleTime;
+        IMFMediaBuffer cb = s.ConvertToContiguousBuffer();
+        cb.Lock(out IntPtr p, out _, out int _);
+        try
+        {
+            byte[] bgra = Nv12ToBgra(p);
+            FrameDecoded?.Invoke(bgra, DisplayW, DisplayH, pts);
+        }
+        finally
+        {
+            cb.Unlock();
+            cb.Dispose();
+        }
+    }
+
+    /// <summary>NV12 (BT.709 limited range) → BGRA32 top-down, cropped to the display rectangle. Fills and returns the reused <see cref="_bgra"/> buffer.</summary>
+    private byte[] Nv12ToBgra(IntPtr nv12)
+    {
+        int w = DisplayW, h = DisplayH, stride = _stride;
+        int uvOffset = stride * _codedH;
+        int need = w * h * 4;
+        if (_bgra.Length != need) _bgra = new byte[need];
+        byte[] outp = _bgra;
+
+        unsafe
+        {
+            byte* src = (byte*)nv12;
+            fixed (byte* dstFixed = outp)
+            {
+                byte* dst = dstFixed;
+                for (int y = 0; y < h; y++)
+                {
+                    byte* yRow = src + y * stride;
+                    byte* uvRow = src + uvOffset + (y >> 1) * stride;
+                    byte* d = dst + y * w * 4;
+                    for (int x = 0; x < w; x++)
+                    {
+                        int c = yRow[x] - 16;
+                        int uvx = (x >> 1) << 1;
+                        int dd = uvRow[uvx] - 128;
+                        int e = uvRow[uvx + 1] - 128;
+
+                        int r = (298 * c + 459 * e + 128) >> 8;
+                        int g = (298 * c - 55 * dd - 136 * e + 128) >> 8;
+                        int b = (298 * c + 541 * dd + 128) >> 8;
+
+                        d[0] = (byte)(b < 0 ? 0 : b > 255 ? 255 : b);
+                        d[1] = (byte)(g < 0 ? 0 : g > 255 ? 255 : g);
+                        d[2] = (byte)(r < 0 ? 0 : r > 255 ? 255 : r);
+                        d[3] = 255;
+                        d += 4;
+                    }
+                }
+            }
+        }
+        return outp;
+    }
+
+    private static ulong Pack(int hi, int lo) => ((ulong)(uint)hi << 32) | (uint)lo;
+
+    public void Dispose()
+    {
+        try { _mft?.ProcessMessage(TMessageType.MessageNotifyEndOfStream, UIntPtr.Zero); } catch { }
+        try { _mft?.ProcessMessage(TMessageType.MessageNotifyEndStreaming, UIntPtr.Zero); } catch { }
+        try { _mft?.Dispose(); } catch { }
+        if (_mfStarted) { try { MediaFactory.MFShutdown(); } catch { } _mfStarted = false; }
+    }
+}

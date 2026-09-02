@@ -18,4 +18,20 @@ public static class Ntp
     public static ulong ToRtpTimestamp(ulong ntp, uint sampleRate) => ((ntp >> 16) * sampleRate) >> 16;
 
     public static ulong FromRtpTimestamp(ulong rtpTimestamp, uint sampleRate) => ((rtpTimestamp << 16) / sampleRate) << 16;
+
+    /// <summary>
+    /// A 64-bit NTP fixed-point timestamp (seconds in the high 32 bits, a 2^32-scaled
+    /// fraction in the low 32) to whole nanoseconds. Byte-for-byte the same math as
+    /// UxPlay's <c>raop_ntp_timestamp_to_nano_seconds</c> with
+    /// <c>account_for_epoch_diff=false</c> — the mirror packet header carries the
+    /// per-frame presentation time in exactly this format at offset 8 (NOT a raw
+    /// nanosecond count: reading it as one made every frame's timestamp advance ~4.29x
+    /// too slowly, so a 60fps stream played back at ~14fps and frames piled up).
+    /// </summary>
+    public static ulong ToNanoseconds(ulong ntpTimestamp)
+    {
+        ulong seconds = ntpTimestamp >> 32;
+        ulong fraction = ntpTimestamp & 0xFFFFFFFF;
+        return seconds * 1_000_000_000UL + ((fraction * 1_000_000_000UL) >> 32);
+    }
 }
