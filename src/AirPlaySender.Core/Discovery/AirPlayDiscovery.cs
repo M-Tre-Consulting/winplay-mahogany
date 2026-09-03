@@ -49,24 +49,32 @@ public sealed class AirPlayDiscovery
             // `.Name`, while `.ServiceName` is the full per-instance name —
             // verified directly against a live response, not assumed.
             IService? raop = host.Services.Values.FirstOrDefault(s => s.Name == RaopServiceType);
-            // No RAOP endpoint on this host = nothing we can stream audio to.
-            if (raop is null) continue;
+            IService? airplay = host.Services.Values.FirstOrDefault(s => s.Name == AirPlayServiceType);
+            // A mirroring-only target (a TV with no standalone AirPlay speaker
+            // role — confirmed live: a real AirPlay TV advertises ONLY
+            // _airplay._tcp, no _raop._tcp at all) has no RAOP endpoint. Only
+            // requiring RAOP here silently dropped every such device from
+            // discovery — found live, not by inspection: this device search
+            if (raop is null && airplay is null) continue;
 
             var merged = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            MergeProperties(merged, raop.Properties);
-            IService? airplay = host.Services.Values.FirstOrDefault(s => s.Name == AirPlayServiceType);
-            if (airplay is not null)
-                MergeProperties(merged, airplay.Properties);
+            if (raop is not null) MergeProperties(merged, raop.Properties);
+            if (airplay is not null) MergeProperties(merged, airplay.Properties);
 
             string ip = host.IPAddress ?? host.IPAddresses.FirstOrDefault() ?? "";
-            if (ip.Length == 0 || raop.Port == 0) continue;
+            // Prefer RAOP's port (legacy RTSP audio) when both exist — same
+            // port choice this method already made before airplay-only devices
+            // were reachable at all — else fall back to _airplay._tcp's own.
+            int port = raop?.Port > 0 ? raop.Port : airplay?.Port ?? 0;
+            if (ip.Length == 0 || port == 0) continue;
 
+            string instanceName = raop?.ServiceName ?? airplay!.ServiceName;
             devices.Add(new AirPlayDevice
             {
-                Name = CleanInstanceName(raop.ServiceName) is { Length: > 0 } n ? n : host.DisplayName,
+                Name = CleanInstanceName(instanceName) is { Length: > 0 } n ? n : host.DisplayName,
                 Host = ip,
-                Port = raop.Port,
-                DeviceId = raop.ServiceName,
+                Port = port,
+                DeviceId = instanceName,
                 Properties = merged,
             });
         }
@@ -81,16 +89,19 @@ public sealed class AirPlayDiscovery
     }
 
     /// <summary>
-    /// RAOP instance names look like "AA:BB:CC:DD:EE:FF@Living Room._raop._tcp.local."
-    /// (or, depending on the resolver, without the trailing service suffix).
-    /// Strips the MAC-address prefix and any trailing service-type suffix to
-    /// get the human-readable name.
+    /// Instance names look like "AA:BB:CC:DD:EE:FF@Living Room._raop._tcp.local."
+    /// (RAOP) or "AA:BB:CC:DD:EE:FF@Living Room._airplay._tcp.local." (an
+    /// airplay-only, e.g. mirroring-only, device) — or, depending on the
+    /// resolver, without the trailing service suffix. Strips the MAC-address
+    /// prefix and either trailing service-type suffix to get the human-readable
+    /// name.
     /// </summary>
-    private static string CleanInstanceName(string raopInstanceName)
+    private static string CleanInstanceName(string instanceName)
     {
-        int at = raopInstanceName.IndexOf('@');
-        string s = at >= 0 ? raopInstanceName[(at + 1)..] : raopInstanceName;
+        int at = instanceName.IndexOf('@');
+        string s = at >= 0 ? instanceName[(at + 1)..] : instanceName;
         int suffix = s.IndexOf("._raop", StringComparison.OrdinalIgnoreCase);
+        if (suffix < 0) suffix = s.IndexOf("._airplay", StringComparison.OrdinalIgnoreCase);
         return (suffix >= 0 ? s[..suffix] : s).Trim();
     }
 }

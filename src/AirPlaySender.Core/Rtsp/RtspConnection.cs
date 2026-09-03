@@ -130,25 +130,16 @@ public sealed class RtspConnection : IAsyncDisposable
 
     /// <summary>
     /// <c>POST /fp-setup</c> — the FairPlay round-trip (see
-    /// <see cref="SendPairingPostAsync"/> (HTTP/1.1, <c>application/octet-stream</c>)
-    /// but with no <c>X-Apple-HKP</c> header — that header is specific to
-    /// the HAP pair-setup/pair-verify POSTs, not fp-setup.
+    /// device (a Hisense AirPlay-2 TV) used <see cref="SendPairingPostAsync"/>'s
+    /// HTTP/1.1 shape and got a flat HTTP 404 — the request never even routed.
+    /// This is the "realtime handshake" family instead (<see
+    /// cref="SendAp2RtspAsync"/>'s RTSP/1.0 shape, same as <c>GET /info</c> and
+    /// <c>SETUP</c>, which this project's own real capture log shows fp-setup
+    /// sitting right alongside), not the separate HAP pairing POST family
+    /// pair-setup/pair-verify belong to.
     /// </summary>
-    public Task<RtspResponse> SendFpSetupAsync(byte[] body, CancellationToken ct = default)
-    {
-        var sb = new StringBuilder();
-        sb.Append("POST /fp-setup HTTP/1.1\r\n");
-        sb.Append("CSeq: ").Append(_cseq++).Append("\r\n");
-        sb.Append("User-Agent: AirPlay/550.10\r\n");
-        sb.Append("Connection: keep-alive\r\n");
-        sb.Append("DACP-ID: ").Append(DacpId).Append("\r\n");
-        sb.Append("Active-Remote: ").Append(ActiveRemote).Append("\r\n");
-        sb.Append("Client-Instance: ").Append(DacpId).Append("\r\n");
-        sb.Append("X-Apple-Client-Name: WinPlay Mahogany\r\n");
-        sb.Append("Content-Type: application/octet-stream\r\n");
-        sb.Append("Content-Length: ").Append(body.Length).Append("\r\n\r\n");
-        return ExchangeAsync(sb.ToString(), body, ct);
-    }
+    public Task<RtspResponse> SendFpSetupAsync(byte[] body, CancellationToken ct = default) =>
+        SendAp2RtspAsync("POST", "/fp-setup", "application/octet-stream", body, ct: ct);
 
     /// <summary>AirPlay-2 realtime handshake: GET /info and the binary-plist SETUP/RECORD — RTSP *methods* on the <c>rtsp://</c> URI, not an HTTP path (which 404s), but the reply carries a plist body.</summary>
     public Task<RtspResponse> SendAp2RtspAsync(string method, string uri, string? contentType = null, byte[]? body = null, bool isStreamSetup = false, CancellationToken ct = default)
