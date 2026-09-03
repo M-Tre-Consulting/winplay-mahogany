@@ -32,4 +32,27 @@ public sealed class PairingIdentity
         Seed32 = Convert.FromHexString(seedHex),
         PairingId = Encoding.UTF8.GetBytes(pairingIdText),
     };
+
+    /// <summary>
+    /// This app's one persistent identity, shared across every kind of session
+    /// key pair regardless of what's being streamed, so a receiver that's
+    /// already paired for audio must see the exact same identity when this app
+    /// later mirrors to it, not a second, unrelated one. Loads the stored one if
+    /// present, otherwise generates and persists a fresh one.
+    /// </summary>
+    public static PairingIdentity LoadOrCreate(CredentialStore store)
+    {
+        StoredCredentials? existing = store.Get("__sender_identity__");
+        if (existing is not null) return FromStorage(Convert.ToHexString(existing.LtSeed), Encoding.UTF8.GetString(existing.PairingId));
+
+        PairingIdentity fresh = CreateNew();
+        store.Set("__sender_identity__", new StoredCredentials
+        {
+            LtSeed = fresh.Seed32,
+            PairingId = fresh.PairingId,
+            AccessoryId = [],
+            AccessoryLtpk = [],
+        });
+        return fresh;
+    }
 }

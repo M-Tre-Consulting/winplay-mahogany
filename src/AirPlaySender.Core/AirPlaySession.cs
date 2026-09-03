@@ -53,24 +53,8 @@ public sealed class AirPlaySession : IAsyncDisposable
     public AirPlaySession(CredentialStore? credentialStore = null, PairingIdentity? identity = null, Func<IAudioCaptureSource>? audioSourceFactory = null)
     {
         _credentials = credentialStore ?? new CredentialStore();
-        _identity = identity ?? LoadOrCreateIdentity(_credentials);
+        _identity = identity ?? PairingIdentity.LoadOrCreate(_credentials);
         _audioSourceFactory = audioSourceFactory ?? (() => new WasapiLoopbackSource());
-    }
-
-    private static PairingIdentity LoadOrCreateIdentity(CredentialStore store)
-    {
-        StoredCredentials? existing = store.Get("__sender_identity__");
-        if (existing is not null) return PairingIdentity.FromStorage(Convert.ToHexString(existing.LtSeed), System.Text.Encoding.UTF8.GetString(existing.PairingId));
-
-        PairingIdentity fresh = PairingIdentity.CreateNew();
-        store.Set("__sender_identity__", new StoredCredentials
-        {
-            LtSeed = fresh.Seed32,
-            PairingId = fresh.PairingId,
-            AccessoryId = [],
-            AccessoryLtpk = [],
-        });
-        return fresh;
     }
 
     public async Task ConnectAsync(AirPlayDevice device, CancellationToken ct = default)

@@ -49,6 +49,15 @@ public partial class App : Application
         {
             return;
         }
+        {
+            string[] cliArgs = Environment.GetCommandLineArgs();
+            if (mirrorTestIdx >= 0 && mirrorTestIdx + 1 < cliArgs.Length)
+            {
+                string nameFilter = cliArgs[mirrorTestIdx + 1];
+                string? pin = mirrorTestIdx + 2 < cliArgs.Length ? cliArgs[mirrorTestIdx + 2] : null;
+                return;
+            }
+        }
 
         StartupRegistration.EnsureRegistered();
 
