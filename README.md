@@ -11,7 +11,8 @@ AirPlay nativo per Windows, nei due versi:
   mano + blit Win2D, 60fps fluidi per minuti senza freeze), audio (AAC-ELD
   via `libfdk-aac` + `AudioGraph`) e volume (segue lo slider del telefono),
   sincronizzati e verificati dal vivo contro un iPhone 13 Pro Max
-  (iOS 26.6.1). Resta raggiungibile in background (icona nel tray, avvio
+  (iOS 26.6.1) e un iPhone 12 mini (iOS 26.6), entrambi funzionanti alla
+  prima connessione. Resta raggiungibile in background (icona nel tray, avvio
   automatico con Windows), e chiudere il mirroring da un lato lo chiude
   anche dall'altro.
 
@@ -353,9 +354,11 @@ verificati empiricamente in questo progetto:
 
 **Fase 2 (ricevitore di mirroring)**
 
-- Provato contro un iPhone 13 Pro Max, iOS 26.6.1. Altri modelli/versioni
-  potrebbero negoziare uno schema diverso (soprattutto il pairing HAP
-  moderno, di cui c'è solo il pair-verify confermato dal vivo).
+- Provato contro un iPhone 13 Pro Max (iOS 26.6.1) e un iPhone 12 mini
+  (iOS 26.6) — entrambi funzionanti alla prima connessione, senza problemi.
+  Altri modelli/versioni potrebbero negoziare uno schema diverso
+  (soprattutto il pairing HAP moderno, di cui c'è solo il pair-verify
+  confermato dal vivo).
 - Nessun lip-sync misurato: l'audio parte con ~50 ms di buffer, senza
   allineamento esplicito ai timestamp del video.
 - Una sola sessione di mirroring per volta; riconnessioni non provate.
