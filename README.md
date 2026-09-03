@@ -1,26 +1,26 @@
 # WinPlay Mahogany
 
-AirPlay nativo per Windows, nei due versi:
+AirPlay nativo per Windows, in due direzioni:
 
-- **Sender audio** (Fase 1, funzionante): cattura l'audio di sistema e lo
+- **Sender audio** (Fase 1, **funziona** 🎉): cattura l'audio di sistema e lo
   trasmette a qualunque speaker/TV AirPlay 2 (HomePod, Apple TV, altoparlanti
   AirPlay 2 di terze parti), con pairing e crittografia reali.
-- **Ricevitore di mirroring** (Fase 2, **funziona** 🎉 — vedi sotto): fa
-  comparire questo PC come bersaglio "Duplica schermo"/AirPlay nel Centro
-  di Controllo di un iPhone o nella barra menu di un Mac. Video (decoder
-  H.264 MFT di Windows pilotato a mano + blit Win2D, 60fps fluidi per
-  minuti senza freeze), audio (AAC-ELD via `libfdk-aac` + `AudioGraph`) e
-  volume (segue lo slider del telefono), sincronizzati e verificati dal
-  vivo contro un iPhone 13 Pro Max (iOS 26.6.1) e un iPhone 12 mini
-  (iOS 26.6), entrambi funzionanti alla prima connessione, oltre a un
+- **Ricevitore di mirroring** (Fase 2, **funziona** 🎉): fa comparire questo
+  PC come bersaglio "Duplica schermo"/AirPlay nel Centro di Controllo di un
+  iPhone o nella barra menu di un Mac. Video (decoder H.264 MFT di Windows
+  pilotato a mano + blit Win2D, 60fps fluidi per minuti senza freeze),
+  audio (AAC-ELD via `libfdk-aac` + `AudioGraph`) e volume (segue lo slider
+  del telefono), sincronizzati e verificati dal vivo contro un iPhone 13 Pro
+  Max (iOS 26.6.1), un iPhone 12 mini (iOS 26.6) e un iPhone 11 Pro
+  (iOS 26.6.1), tutti funzionanti alla prima connessione, oltre a un
   MacBook Air (Mac14,2, macOS 26) sia in modalità estensione che in
   mirroring letterale (schermo identico), delay percepibile azzerato dopo
   la fix alla conversione colore — vedi "Limitazioni note". Resta
   raggiungibile in background (icona nel tray, avvio automatico con
   Windows), e chiudere il mirroring da un lato lo chiude anche dall'altro.
 
-Apple non pubblica API per nessuno dei due versi su piattaforme non Apple.
-Questo progetto ricostruisce i protocolli (pairing HAP, RTSP cifrato,
+Apple non pubblica API per nessuna delle due direzioni su piattaforme non
+Apple. Questo progetto ricostruisce i protocolli (pairing HAP, RTSP cifrato,
 streaming RTP, e per il mirroring il cifrario FairPlay vero) seguendo la
 documentazione tecnica di alcuni progetti open source indipendenti, validati
 dove possibile su hardware reale — vedi [NOTICE.md](NOTICE.md) per
@@ -55,6 +55,79 @@ dettagli, in breve:
   *prima* — se il ricevitore prova a sincronizzarsi e nessuno ascolta
   ancora, resta in attesa e il SETUP non risponde mai. Bastava invertire
   l'ordine.
+
+**Revisione approfondita (2026-09-04)**: rilette da cima a fondo tutte le
+parti raggiungibili dalla Fase 1 (orchestratore, trasporto audio, cattura
+WASAPI, pairing, RTSP, discovery, UI), file per file, cercando bug concreti
+invece di ipotesi — otto trovati e corretti, tutti confermati da lettura
+diretta del codice:
+
+1. `RtpAudioTransport` prometteva nel proprio commento "pacchetti di sync
+   NTP a 1Hz" ma `SendSyncPacket` veniva chiamato una sola volta, mai in
+   loop — nessuna risincronizzazione su una sessione lunga (una possibile
+   causa di desync/glitch col tempo che un test breve non avrebbe mai
+   mostrato). Aggiunto il loop mancante.
+2. Il buffer di ritrasmissione (`_backlog`) veniva scritto dal thread del
+   pacer e letto dal thread di controllo senza sincronizzazione — race
+   reale, possibile pacchetto ritrasmesso con contenuto sbagliato.
+   Aggiunto un lock minimo.
+3. Buffer di sicurezza della cattura WASAPI ridotto da 2s a 500ms — con
+   lo scarto automatico che scatta solo a buffer pieno, un tetto più
+   corto limita quanto la cattura può restare indietro prima che la
+   correzione intervenga.
+4. `AirPlaySession.ConnectAsync`, se falliva a metà (pairing rifiutato,
+   handshake respinto — tutt'altro che raro), lasciava lo stato bloccato
+   e la UI scartava la sessione senza mai chiamare `DisposeAsync` — leak
+   di socket/loop in background a ogni tentativo fallito. Ora fa sempre
+   pulizia prima di propagare l'errore.
+5. Il volume di partenza "udibile" (100%, non muto di default) si
+   applicava solo su AirPlay 2 — su AirPlay 1 (vecchi AirPort Express) la
+   sessione poteva restare silenziosa al volume/mute lasciato da prima,
+   lo stesso problema che il fix AirPlay-2 doveva evitare.
+6. Un click su "Connetti" mentre un altro dispositivo era ancora in fase
+   di connessione non aveva nessuna protezione — un tentativo vecchio che
+   finiva in ritardo poteva sovrascrivere lo stato UI di quello nuovo.
+7. Un "Aggiorna" mentre connessi che non ritrovava il dispositivo (mDNS
+   già documentato flaky in questo progetto) lo faceva sparire dalla
+   lista, e con lui il pulsante "Disconnetti", anche a sessione ancora
+   attiva. Il dispositivo connesso ora resta visibile finché una
+   scansione futura non lo ritrova.
+8. `AirPlayFeatureParser.ParseFeatures` combinava le due metà a 32-bit
+   del bitmask `features` con concatenazione di stringhe esadecimali
+   invece che con uno shift numerico — corretto solo se la metà bassa
+   aveva sempre tutti e 8 i caratteri (zero iniziali inclusi), esattamente
+   il caso che ogni test esistente usava, per questo mai scoperto prima.
+   Un dispositivo che manda la metà bassa senza zero iniziali avrebbe
+   prodotto un bitmask sbagliato — e da quel bitmask dipende tutta la
+   scelta di come autenticarsi. Aggiunto un test di regressione col caso
+   non zero-paddato.
+
+**Ulteriore controllo (2026-09-05)**: un nono bug trovato rileggendo di
+nuovo da zero, stavolta di robustezza più che di correttezza protocollare:
+
+9. `AirPlaySession.DisposeAsync()` avvolgeva in try/catch solo l'invio del
+   TEARDOWN — i quattro passaggi di pulizia successivi (fermare/chiudere la
+   cattura WASAPI, chiudere il trasporto audio, il canale eventi, la
+   connessione RTSP) no, e i due punti della UI che chiamano `DisposeAsync`
+   (il pulsante "Disconnetti", e la disconnessione automatica prima di una
+   nuova connessione) non hanno a loro volta nessun try/catch attorno. Se il
+   dispositivo audio di default cambia o sparisce (cuffie Bluetooth, dock,
+   uscita HDMI) esattamente nel momento della disconnessione, WASAPI può
+   lanciare un'eccezione che, risalendo fino a un handler UI `async void`,
+   avrebbe fatto crashare l'intera app invece di limitarsi a fallire
+   silenziosamente la pulizia — un caso di bordo, non un percorso quotidiano,
+   ma reale. Ogni passaggio è ora indipendente e best-effort.
+
+Aggiunta anche, su richiesta separata: la possibilità di scegliere se
+l'audio duplica anche sugli altoparlanti del PC o resta solo sul
+dispositivo AirPlay — di default la cattura WASAPI *loopback* non
+silenzia mai l'altoparlante locale, quindi senza questa scelta lo streaming
+suonava sempre "doppio". `LocalPlaybackMuter` silenzia/ripristina
+l'endpoint audio di default di Windows mentre la sessione è attiva (la
+cattura loopback continua a funzionare comunque, il muting è a valle);
+in UI è una scelta a due opzioni (`RadioButtons`, non un semplice
+interruttore — un on/off dava l'impressione sbagliata che "off"
+disattivasse l'audio invece di duplicarlo).
 
 Tutta la parte protocollare (`src/AirPlaySender.Core`) ha **73 test
 automatici** (fra gli altri: il formato dei pacchetti di
@@ -201,11 +274,11 @@ src/
       HapPairVerifyAccessorySession.cs  pair-verify HAP TLV8 vero, lato accessorio
       HapPairSetupAccessorySession.cs   pair-setup HAP TLV8, variante transient (ipotesi, non confermata dal vivo)
       FairPlaySetup.cs                handshake /fp-setup (replay di byte catturati da UxPlay)
-      FairPlayCipher.cs               il cifrario FairPlay vero, portato da UxPlay/OmgHax
+      FairPlayCipher.cs               il cifrario FairPlay vero, portato da UxPlay/OmgHax (Decrypt: decifra la chiave di sessione mandata da un vero iPhone/Mac)
       FairPlayCipherTables.g.cs       le sue tabelle S-box, estratte meccanicamente (non a mano)
       MirroringDataReceiver.cs        canale dati video (TCP), framing pacchetti + decrypt, assembla access unit interi (AVCC->Annex-B, SPS/PPS su ogni IDR, timestamp da header offset 8), espone ConfigReceived/FrameReceived
       MirrorAudioReceiver.cs          canale audio (UDP RTP), decrypt AES-128-CBC per pacchetto + riordino/dedup per seq, espone AudioFrameReceived (frame AAC-ELD grezzi)
-      AvcDecoderConfig.cs             AVCDecoderConfigurationRecord + split dei NAL AVCC
+      AvcDecoderConfig.cs             AVCDecoderConfigurationRecord + split/rewrite dei NAL AVCC->Annex-B
       H264Sps.cs                      parser SPS H.264 → larghezza/altezza vere
     AirPlaySession.cs      orchestratore Fase 1: connect → pair → handshake → stream
 
@@ -223,6 +296,7 @@ tests/
   AirPlaySender.Core.Tests/
     TestSupport/                 FakeAirPlay2Receiver — un ricevitore AirPlay 2 indipendente per i test end-to-end
     AirPlaySessionIntegrationTests.cs   handshake completo client↔finto-ricevitore su loopback
+    FairPlayCipherTests.cs       Decrypt su un vettore reale catturato da un iPhone
     *Tests.cs                    xUnit — crypto, TLV8, bplist, encoder ALAC, feature flags
 ```
 
@@ -357,11 +431,12 @@ verificati empiricamente in questo progetto:
 
 **Fase 2 (ricevitore di mirroring)**
 
-- Provato contro un iPhone 13 Pro Max (iOS 26.6.1) e un iPhone 12 mini
-  (iOS 26.6) — entrambi funzionanti alla prima connessione, senza problemi.
-  Provato anche contro un MacBook Air (Mac14,2, macOS 26) in entrambe le
+- Provato contro un iPhone 13 Pro Max (iOS 26.6.1), un iPhone 12 mini
+  (iOS 26.6) e un iPhone 11 Pro (iOS 26.6.1) — tutti funzionanti alla prima
+  connessione, senza problemi. Provato anche contro un MacBook Air
+  (Mac14,2, macOS 26) in entrambe le
   modalità di Screen Mirroring — estensione e mirror letterale. Inizialmente
-  con un delay percepibile assente sui due iPhone: causa trovata nel log
+  con un delay percepibile assente sugli iPhone: causa trovata nel log
   (il Mac manda 2560x1440 contro i 666x1440 dell'iPhone, ~3,8x pixel per
   frame; la conversione colore NV12→BGRA in `H264Mft.Nv12ToBgra` era un
   ciclo scalare per-pixel sul thread di decodifica, ~30ms/frame a quella
@@ -398,11 +473,8 @@ verificati empiricamente in questo progetto:
      forma corretta — vedi sopra) resta un'incognita a bassa priorità: il
      percorso legacy già collegato funziona fino in fondo.
   3. Riconnessioni / più stream nella stessa sessione — non ancora provate.
-- **Fase 2b (sender di mirroring, Windows → TV)**: non affrontata, R&D
-  ancora più aperta di quanto sopra — nessun progetto open source esiste per
-  questo verso. Vedi la discussione nella cronologia del progetto per la
-  valutazione completa.
 
 ## Licenza e attribuzioni
 
 Vedi [NOTICE.md](NOTICE.md).
+</content>

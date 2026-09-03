@@ -13,4 +13,10 @@
     <PackageReference Include="Zeroconf" Version="3.7.16" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Lets the test project pin a handful of internal seams directly (the
+         instead of everything under Sending/ needing to be public API. -->
+    <InternalsVisibleTo Include="AirPlaySender.Core.Tests" />
+  </ItemGroup>
+
 </Project>
