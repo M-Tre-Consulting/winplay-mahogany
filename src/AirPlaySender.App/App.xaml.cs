@@ -40,6 +40,16 @@ public partial class App : Application
 
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
+        // TEMPORARY, throwaway: live-verifies ScreenCapture actually captures
+        // real desktop content, since it can't be checked against an oracle
+        // encoder are wired into the real mirroring-sender flow.
+        {
+            return;
+        }
+        {
+            return;
+        }
+
         StartupRegistration.EnsureRegistered();
 
         _window = new MainWindow();
