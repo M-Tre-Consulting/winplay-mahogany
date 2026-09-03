@@ -361,20 +361,21 @@ verificati empiricamente in questo progetto:
   (iOS 26.6) — entrambi funzionanti alla prima connessione, senza problemi.
   Provato anche contro un MacBook Air (Mac14,2, macOS 26) in entrambe le
   modalità di Screen Mirroring — estensione e mirror letterale — funziona,
-  ma con un delay percepibile che sui due iPhone non c'è. Dal log: il Mac
-  manda 2560x1440 contro i 666x1440 dell'iPhone (~3,8x pixel per frame), e
-  la conversione colore NV12→BGRA in `H264Mft.Nv12ToBgra` è un ciclo
-  scalare per-pixel in C# (nessun SIMD), eseguito sullo stesso thread di
-  decodifica prima di presentare — a quella risoluzione non tiene il passo
-  dei 60fps in ingresso: il watchdog registra una coda che sale fino a
-  ~180 frame non ancora mostrati (diversi secondi a 60fps) prima di
-  rientrare, poi risale al prossimo picco. Non ancora corretto — indiziato
-  ma non confermato con una fix live sul Mac (richiede: SIMD/vettorizzare
-  la conversione colore, o smettere di presentare i frame quando la coda è
-  in ritardo, decodificandoli comunque per non rompere la catena di
-  P-frame). Altri modelli/versioni di iPhone o Mac potrebbero negoziare
-  uno schema diverso (soprattutto il pairing HAP moderno, di cui c'è solo
-  il pair-verify confermato dal vivo).
+  ma con un delay percepibile che sui due iPhone non c'è. Causa trovata nel
+  log: il Mac manda 2560x1440 contro i 666x1440 dell'iPhone (~3,8x pixel
+  per frame) e la conversione colore NV12→BGRA (`H264Mft.Nv12ToBgra`) era
+  un ciclo scalare per-pixel in C# sul thread di decodifica — misurata a
+  ~30ms/frame a quella risoluzione, da sola oltre il budget di 16,7ms per
+  60fps, da cui la coda che il watchdog registrava salire fino a ~180
+  frame di ritardo. **Mitigata** (non ancora confermata dal vivo — nessun
+  Mac/iPhone disponibile per riprovare in questa sessione): la conversione
+  ora gira in parallelo per riga con `Parallel.For` (stessa identica
+  matematica per pixel, verificata byte-per-byte identica su un harness
+  sintetico), ~4,8ms/frame nello stesso benchmark, 6,3x più veloce. Da
+  confermare che il delay percepito sia sceso nella pratica. Altri
+  modelli/versioni di iPhone o Mac potrebbero negoziare uno schema diverso
+  (soprattutto il pairing HAP moderno, di cui c'è solo il pair-verify
+  confermato dal vivo).
 - Nessun lip-sync misurato: l'audio parte con ~50 ms di buffer, senza
   allineamento esplicito ai timestamp del video.
 - Una sola sessione di mirroring per volta; riconnessioni non provate.
@@ -399,9 +400,10 @@ verificati empiricamente in questo progetto:
      percorso legacy già collegato funziona fino in fondo.
   3. Riconnessioni / più stream nella stessa sessione — non ancora provate.
   4. **Delay col Mac ad alta risoluzione**: la conversione colore NV12→BGRA
-     scalare in `Nv12ToBgra` non tiene il passo a 2560x1440/60fps (vedi
-     "Limitazioni note") — da vettorizzare o da disaccoppiare dalla
-     presentazione quando la coda è in ritardo.
+     era scalare in `Nv12ToBgra` e non teneva il passo a 2560x1440/60fps
+     (vedi "Limitazioni note") — ora parallelizzata per riga (`Parallel.For`,
+     6,3x più veloce nel benchmark sintetico); manca ancora una conferma
+     dal vivo su un Mac reale.
 - **Fase 2b (sender di mirroring, Windows → TV)**: non affrontata, R&D
   ancora più aperta di quanto sopra — nessun progetto open source esiste per
   questo verso. Vedi la discussione nella cronologia del progetto per la

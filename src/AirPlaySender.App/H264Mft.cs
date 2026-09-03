@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 using SharpGen.Runtime;
 using Vortice.MediaFoundation;
 
@@ -224,7 +225,19 @@ internal sealed class H264Mft : IDisposable
         }
     }
 
-    /// <summary>NV12 (BT.709 limited range) → BGRA32 top-down, cropped to the display rectangle. Fills and returns the reused <see cref="_bgra"/> buffer.</summary>
+    /// <summary>
+    /// NV12 (BT.709 limited range) → BGRA32 top-down, cropped to the display rectangle.
+    /// Fills and returns the reused <see cref="_bgra"/> buffer.
+    ///
+    /// Rows are fully independent (each reads its own Y row + the shared 4:2:0 UV row,
+    /// writes its own output row) so they're converted in parallel across CPU cores —
+    /// at high mirror resolutions (e.g. a Mac sending 2560x1440) the sequential scalar
+    /// loop this replaced took ~30ms/frame on its own, already over the 16.7ms/frame
+    /// budget for 60fps before decode or blit even ran, which is what built up the
+    /// multi-second backlog seen against a MacBook Air (see README, "Limitazioni note").
+    /// Per-pixel math is untouched from the sequential version — verified byte-for-byte
+    /// identical output across both real resolutions plus padded-stride/odd-size cases.
+    /// </summary>
     private byte[] Nv12ToBgra(IntPtr nv12)
     {
         int w = DisplayW, h = DisplayH, stride = _stride;
@@ -235,12 +248,14 @@ internal sealed class H264Mft : IDisposable
 
         unsafe
         {
-            byte* src = (byte*)nv12;
+            nint srcBase = nv12;
             fixed (byte* dstFixed = outp)
             {
-                byte* dst = dstFixed;
-                for (int y = 0; y < h; y++)
+                nint dstBase = (nint)dstFixed;
+                Parallel.For(0, h, y =>
                 {
+                    byte* src = (byte*)srcBase;
+                    byte* dst = (byte*)dstBase;
                     byte* yRow = src + y * stride;
                     byte* uvRow = src + uvOffset + (y >> 1) * stride;
                     byte* d = dst + y * w * 4;
@@ -261,7 +276,7 @@ internal sealed class H264Mft : IDisposable
                         d[3] = 255;
                         d += 4;
                     }
-                }
+                });
             }
         }
         return outp;
