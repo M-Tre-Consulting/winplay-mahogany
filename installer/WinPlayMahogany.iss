@@ -18,7 +18,7 @@
 ; the installer/uninstaller entry; everything else rarely needs to change.
 
 #define MyAppName "WinPlay Mahogany"
-#define MyAppVersion "0.2.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "M-Tre Consulting"
 #define MyAppExeName "AirPlaySender.App.exe"
 #define MyPublishDir "..\src\AirPlaySender.App\bin\Release\net9.0-windows10.0.19041.0\win-x64\publish"
