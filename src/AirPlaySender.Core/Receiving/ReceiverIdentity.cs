@@ -39,40 +39,55 @@ public sealed class ReceiverIdentity
     /// <summary>Loads the persisted identity, creating and saving a new one on first run.</summary>
     public static ReceiverIdentity LoadOrCreate(string? path = null)
     {
-        path ??= DefaultPath;
+        string savePath = path ?? DefaultPath;
+        // Pre-rename location: read from it if the new one isn't there yet, so an upgrade
+        // keeps the same identity (the iPhone recognises "PC-NICO" and doesn't re-prompt),
+        // then migrate it to the new path.
+        string readPath = path is null && !File.Exists(savePath) && File.Exists(LegacyPath) ? LegacyPath : savePath;
         try
         {
-            if (File.Exists(path))
+            if (File.Exists(readPath))
             {
-                Stored? stored = JsonSerializer.Deserialize<Stored>(File.ReadAllText(path));
+                Stored? stored = JsonSerializer.Deserialize<Stored>(File.ReadAllText(readPath));
                 if (stored is { Seed32Hex.Length: > 0 })
                 {
-                    return new ReceiverIdentity
+                    var loaded = new ReceiverIdentity
                     {
                         Seed32 = Convert.FromHexString(stored.Seed32Hex),
                         Pi = Guid.Parse(stored.Pi),
                     };
+                    if (readPath != savePath) TrySave(loaded, savePath); // migrate from the legacy folder
+                    return loaded;
                 }
             }
         }
         catch { /* a corrupt file just means "generate a new identity", not a crash */ }
 
         ReceiverIdentity created = CreateNew();
+        TrySave(created, savePath);
+        return created;
+    }
+
+    private static void TrySave(ReceiverIdentity id, string path)
+    {
         try
         {
             string? dir = Path.GetDirectoryName(path);
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
             File.WriteAllText(path, JsonSerializer.Serialize(new Stored
             {
-                Seed32Hex = Convert.ToHexString(created.Seed32),
-                Pi = created.Pi.ToString(),
+                Seed32Hex = Convert.ToHexString(id.Seed32),
+                Pi = id.Pi.ToString(),
             }, new JsonSerializerOptions { WriteIndented = true }));
         }
         catch { /* best-effort persistence — losing it just means a new identity next run */ }
-        return created;
     }
 
     private static string DefaultPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "WinPlayMahogany", "receiver-identity.json");
+
+    private static string LegacyPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "AirPlayForWindows", "receiver-identity.json");
 

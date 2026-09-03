@@ -7,10 +7,10 @@
     Two steps, both scripted so this is a one-command rebuild:
       1. `dotnet publish` the WinUI 3 app, self-contained win-x64 (no .NET
          runtime needed on the target machine).
-      2. Run that publish output through installer\AirPlayWindows.iss via
+      2. Run that publish output through installer\WinPlayMahogany.iss via
          Inno Setup's command-line compiler (ISCC.exe).
 
-    Output: installer\output\AirPlayWindows-Setup-<version>.exe
+    Output: installer\output\WinPlayMahogany-Setup-<version>.exe
 
 .PARAMETER InnoCompiler
     Path to ISCC.exe. Defaults to the standard per-user winget install
@@ -104,7 +104,7 @@ if (-not (Test-Path $InnoCompiler)) {
 }
 
 Write-Host "==> ISCC.exe (Inno Setup)" -ForegroundColor Cyan
-& $InnoCompiler (Join-Path $PSScriptRoot "AirPlayWindows.iss")
+& $InnoCompiler (Join-Path $PSScriptRoot "WinPlayMahogany.iss")
 if ($LASTEXITCODE -ne 0) { throw "ISCC.exe failed with exit code $LASTEXITCODE" }
 
 Write-Host "==> Done. Installer in installer\output\" -ForegroundColor Green

@@ -263,12 +263,12 @@ disinstallatore vero:
 powershell -File installer\build-installer.ps1
 ```
 
-Output: `installer\output\AirPlayWindows-Setup-<versione>.exe`. Lo script fa
+Output: `installer\output\WinPlayMahogany-Setup-<versione>.exe`. Lo script fa
 due cose, entrambe scriptate apposta per restare un comando solo:
 
 1. `dotnet publish` in configurazione Release, self-contained (nessun .NET
    da installare sulla macchina di chi lo riceve).
-2. Compila `installer/AirPlayWindows.iss` con `ISCC.exe`.
+2. Compila `installer/WinPlayMahogany.iss` con `ISCC.exe`.
 
 **Nota per chi tocca lo script**: `dotnet publish` di un'app WinUI 3 non
 pacchettizzata *non* copia l'output XAML compilato dell'app

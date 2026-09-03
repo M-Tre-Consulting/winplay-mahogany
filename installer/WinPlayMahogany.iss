@@ -12,7 +12,7 @@
 ; How to (re)build the installer, end to end:
 ;   powershell -File installer\build-installer.ps1
 ; That does the `dotnet publish` + runs this script through ISCC.exe and
-; leaves AirPlayWindows-Setup-<version>.exe in installer\output\.
+; leaves WinPlayMahogany-Setup-<version>.exe in installer\output\.
 ;
 ; To edit: bump MyAppVersion below when you want a new version number on
 ; the installer/uninstaller entry; everything else rarely needs to change.
@@ -28,14 +28,14 @@ AppId={{9D6E9C7B-6E3B-4C2C-8C0B-2E7C6C6E9A11}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-DefaultDirName={localappdata}\Programs\AirPlayWindows
+DefaultDirName={localappdata}\Programs\WinPlayMahogany
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 ; Per-user install, no admin/UAC prompt — friendlier for an unsigned app
 ; that a friend is installing on their own PC.
 PrivilegesRequired=lowest
 OutputDir=output
-OutputBaseFilename=AirPlayWindows-Setup-{#MyAppVersion}
+OutputBaseFilename=WinPlayMahogany-Setup-{#MyAppVersion}
 SetupIconFile=..\src\AirPlaySender.App\Assets\AppIcon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2

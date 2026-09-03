@@ -29,13 +29,14 @@ public sealed class CredentialStore
     }
 
     private readonly string _path;
+    private readonly string? _legacyPath; // pre-rename location; read once so an upgrade doesn't lose saved pairings
     private Dictionary<string, Entry> _entries = new();
 
     public CredentialStore(string? path = null)
     {
-        _path = path ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "AirPlayForWindows", "credentials.json");
+        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        _path = path ?? Path.Combine(localAppData, "WinPlayMahogany", "credentials.json");
+        _legacyPath = path is null ? Path.Combine(localAppData, "AirPlayForWindows", "credentials.json") : null;
         Load();
     }
 
@@ -43,8 +44,11 @@ public sealed class CredentialStore
     {
         try
         {
-            if (File.Exists(_path))
-                _entries = JsonSerializer.Deserialize<Dictionary<string, Entry>>(File.ReadAllText(_path))
+            string src = File.Exists(_path) ? _path
+                       : _legacyPath is not null && File.Exists(_legacyPath) ? _legacyPath
+                       : _path;
+            if (File.Exists(src))
+                _entries = JsonSerializer.Deserialize<Dictionary<string, Entry>>(File.ReadAllText(src))
                            ?? new Dictionary<string, Entry>();
         }
         catch

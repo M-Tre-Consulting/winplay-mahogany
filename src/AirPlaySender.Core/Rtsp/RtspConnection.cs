@@ -105,7 +105,7 @@ public sealed class RtspConnection : IAsyncDisposable
         sb.Append("Client-Instance: ").Append(DacpId).Append("\r\n");
         if (extraHeaders is not null)
             foreach ((string name, string value) in extraHeaders) sb.Append(name).Append(": ").Append(value).Append("\r\n");
-        sb.Append("X-Apple-Client-Name: AirPlayForWindows\r\n");
+        sb.Append("X-Apple-Client-Name: WinPlay Mahogany\r\n");
         AppendContentHeadersAndTerminator(sb, contentType, body);
         return ExchangeAsync(sb.ToString(), body, ct);
     }
@@ -122,7 +122,7 @@ public sealed class RtspConnection : IAsyncDisposable
         sb.Append("DACP-ID: ").Append(DacpId).Append("\r\n");
         sb.Append("Active-Remote: ").Append(ActiveRemote).Append("\r\n");
         sb.Append("Client-Instance: ").Append(DacpId).Append("\r\n");
-        sb.Append("X-Apple-Client-Name: AirPlayForWindows\r\n");
+        sb.Append("X-Apple-Client-Name: WinPlay Mahogany\r\n");
         sb.Append("Content-Type: application/octet-stream\r\n");
         sb.Append("Content-Length: ").Append(body.Length).Append("\r\n\r\n");
         return ExchangeAsync(sb.ToString(), body, ct);

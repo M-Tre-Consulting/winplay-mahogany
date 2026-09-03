@@ -20,7 +20,7 @@ public enum AirPlaySessionState { Idle, Connecting, Pairing, Handshake, Streamin
 /// </summary>
 public sealed class AirPlaySession : IAsyncDisposable
 {
-    private const string ClientName = "AirPlayForWindows";
+    private const string ClientName = "WinPlay Mahogany"; // the "name" the receiver shows for this sender
 
     private readonly CredentialStore _credentials;
     private readonly PairingIdentity _identity;
