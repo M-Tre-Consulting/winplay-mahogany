@@ -211,15 +211,26 @@ public sealed partial class MirrorWindow : Window
 
         if (_swapPanel is null)
         {
+            // Fixed size + Center (not Stretch): a CanvasSwapChainPanel doesn't
+            // scale its swap chain's pixels to fill a differently-sized panel —
+            // it composites them at native size anchored top-left. With Stretch
+            // alignment that meant a portrait iPhone stream (much narrower than
+            // a maximized/windowed RootGrid) sat pinned to the top-left corner
+            // instead of centered, with all the extra black space to its right —
+            // found live, reported by the user ("resta a sinistra"). RootGrid
+            // stays Stretch and black, giving the letterbox/pillarbox behind it.
             _swapPanel = new CanvasSwapChainPanel
             {
-                HorizontalAlignment = Microsoft.UI.Xaml.HorizontalAlignment.Stretch,
-                VerticalAlignment = Microsoft.UI.Xaml.VerticalAlignment.Stretch,
+                HorizontalAlignment = Microsoft.UI.Xaml.HorizontalAlignment.Center,
+                VerticalAlignment = Microsoft.UI.Xaml.VerticalAlignment.Center,
             };
             RootGrid.Children.Add(_swapPanel);
         }
 
         if (_swapChain is not null && _surfaceWidth == width && _surfaceHeight == height) return;
+
+        _swapPanel.Width = width;
+        _swapPanel.Height = height;
 
         CanvasDevice device = _canvasDevice ??= CanvasDevice.GetSharedDevice();
         lock (_renderGate)
