@@ -43,17 +43,19 @@
                     <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
                 <TextBlock Grid.Column="0" Text="Dispositivi disponibili" FontSize="20" FontWeight="SemiBold" VerticalAlignment="Center" />
-                <Button Grid.Column="1" x:Name="RescanButton" Click="OnRescanClicked" ToolTipService.ToolTip="Cerca di nuovo">
-                    <StackPanel Orientation="Horizontal" Spacing="6">
-                        <SymbolIcon Symbol="Refresh" />
-                        <TextBlock Text="Aggiorna" />
-                    </StackPanel>
-                </Button>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+                    <!-- spinner della scansione: accanto al pulsante Aggiorna, non al centro dello schermo -->
+                    <ProgressRing x:Name="ScanningRing" IsActive="False" Width="18" Height="18" />
+                    <Button x:Name="RescanButton" Click="OnRescanClicked" ToolTipService.ToolTip="Cerca di nuovo">
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                            <SymbolIcon Symbol="Refresh" />
+                            <TextBlock Text="Aggiorna" />
+                        </StackPanel>
+                    </Button>
+                </StackPanel>
             </Grid>
 
             <Grid Grid.Row="1">
-                <ProgressRing x:Name="ScanningRing" IsActive="False" Width="32" Height="32" HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0,40,0,0" />
-
                 <TextBlock x:Name="EmptyStateText"
                            Text="Nessun dispositivo AirPlay trovato sulla rete. Assicurati che HomePod, Apple TV o lo speaker siano accesi e sulla stessa rete Wi-Fi, poi premi Aggiorna."
                            TextWrapping="Wrap" Opacity="0.7" HorizontalAlignment="Center" VerticalAlignment="Top"
