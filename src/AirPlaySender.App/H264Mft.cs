@@ -236,7 +236,8 @@ internal sealed class H264Mft : IDisposable
     /// budget for 60fps before decode or blit even ran, which is what built up the
     /// multi-second backlog seen against a MacBook Air (see README, "Limitazioni note").
     /// Per-pixel math is untouched from the sequential version — verified byte-for-byte
-    /// identical output across both real resolutions plus padded-stride/odd-size cases.
+    /// identical output across both real resolutions plus padded-stride/odd-size cases,
+    /// and confirmed live: the perceptible delay against that MacBook Air dropped to zero.
     /// </summary>
     private byte[] Nv12ToBgra(IntPtr nv12)
     {
