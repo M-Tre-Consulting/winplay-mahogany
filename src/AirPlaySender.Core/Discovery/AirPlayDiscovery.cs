@@ -37,6 +37,15 @@ public sealed class AirPlayDiscovery
             cancellationToken: cancellationToken,
             netInterfacesToSendRequestOn: candidateInterfaces.Length > 0 ? candidateInterfaces : null);
 
+        // This app is itself an _airplay._tcp mirroring receiver (see
+        // AirPlayMirroringAdvertiser, started alongside the audio sender) —
+        // since fixing the mirroring-only exclusion bug above, our own PC's
+        // self-advertisement now passes that filter too and showed up in the
+        // sender's own device list ("PC-NICO", found live). Its TXT record
+        // carries the exact same "deviceid" this machine's advertiser uses
+        // (LocalMachineInfo.MacAddressOrPlaceholder()) — skip anything that matches it.
+        string ownDeviceId = Net.LocalMachineInfo.MacAddressOrPlaceholder();
+
         var devices = new List<AirPlayDevice>();
         foreach (IZeroconfHost host in hosts)
         {
@@ -60,6 +69,10 @@ public sealed class AirPlayDiscovery
             var merged = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             if (raop is not null) MergeProperties(merged, raop.Properties);
             if (airplay is not null) MergeProperties(merged, airplay.Properties);
+
+            if (merged.TryGetValue("deviceid", out string? seenDeviceId) &&
+                string.Equals(seenDeviceId, ownDeviceId, StringComparison.OrdinalIgnoreCase))
+                continue; // this is our own PC's mirroring-receiver self-advertisement
 
             string ip = host.IPAddress ?? host.IPAddresses.FirstOrDefault() ?? "";
             // Prefer RAOP's port (legacy RTSP audio) when both exist — same
