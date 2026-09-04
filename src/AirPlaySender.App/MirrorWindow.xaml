@@ -8,5 +8,5 @@
 
     <!-- The decoded frames are blitted onto a CanvasSwapChainPanel added to this
          grid in code-behind (frame-server mode) — no MediaPlayerElement. -->
-    <Grid x:Name="RootGrid" Background="Black" />
+    <Grid x:Name="RootGrid" Background="Black" IsTabStop="True" />
 </Window>

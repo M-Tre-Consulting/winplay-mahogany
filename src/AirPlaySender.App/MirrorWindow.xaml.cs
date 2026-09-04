@@ -7,6 +7,9 @@ using Microsoft.UI;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Input;
+using Microsoft.UI.Xaml.Media;
 using Windows.Foundation;
 using Windows.Graphics.DirectX;
 using WinRT.Interop;
@@ -62,6 +65,9 @@ public sealed partial class MirrorWindow : Window
     private int _videoWidth = 1920, _videoHeight = 1080;
     private volatile bool _ended;
 
+    // ---- F11: true full screen (no title bar/borders) --------------------------------
+    private bool _isFullScreen;
+
     // ---- decode + render ------------------------------------------------------------
     private H264Mft? _decoder;
     private Thread? _decodeThread;
@@ -77,6 +83,7 @@ public sealed partial class MirrorWindow : Window
     // from the UI thread while the decode thread is mid-present.
     private readonly object _renderGate = new();
     private CanvasDevice? _canvasDevice;
+    private Viewbox? _swapViewbox;
     private CanvasSwapChainPanel? _swapPanel;
     private CanvasSwapChain? _swapChain;
     private CanvasRenderTarget? _renderTarget; // persistent blit target — SetPixelBytes each frame, no per-frame GPU alloc
@@ -87,6 +94,39 @@ public sealed partial class MirrorWindow : Window
         InitializeComponent();
         Title = "WinPlay Mahogany — Mirroring";
         SetWindowIcon();
+        RootGrid.KeyDown += RootGrid_KeyDown;
+    }
+
+    /// <summary>
+    /// F11 toggles a true full-screen presenter (no title bar, no borders,
+    /// covers the whole monitor) — requested so mirroring a wide/oddly-shaped
+    /// source (e.g. a Mac's own screen) isn't cropped by window chrome the way
+    /// it would be under a maximized-but-still-bordered window. The video
+    /// already scales correctly to whatever space it's given (see the Viewbox
+    /// in <see cref="EnsureSwapChain"/>), so this only needs to change how
+    /// much space that is.
+    /// </summary>
+    private void RootGrid_KeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (e.Key == Windows.System.VirtualKey.F11)
+        {
+            ToggleFullScreen();
+            e.Handled = true;
+        }
+    }
+
+    private void ToggleFullScreen()
+    {
+        try
+        {
+            nint hwnd = WindowNative.GetWindowHandle(this);
+            WindowId windowId = Win32Interop.GetWindowIdFromWindow(hwnd);
+            AppWindow appWindow = AppWindow.GetFromWindowId(windowId);
+            _isFullScreen = !_isFullScreen;
+            appWindow.SetPresenter(_isFullScreen ? AppWindowPresenterKind.FullScreen : AppWindowPresenterKind.Default);
+            AppLog.Write($"  MirrorWindow: schermo intero {(_isFullScreen ? "attivato" : "disattivato")} (F11)");
+        }
+        catch (Exception ex) { AppLog.Write($"  ToggleFullScreen fallito: {ex}"); }
     }
 
     private void SetWindowIcon()
@@ -175,6 +215,9 @@ public sealed partial class MirrorWindow : Window
                 EnsureSwapChain(width, height);
                 StartDecodePipeline(width, height);
                 Activate();
+                // Needed for RootGrid_KeyDown (F11) to ever fire — a plain Grid
+                // has no keyboard focus by default, even with IsTabStop set.
+                RootGrid.Focus(FocusState.Programmatic);
                 AppLog.Write("  Pipeline di decodifica avviata, finestra attivata");
             }
             catch (Exception ex)
@@ -211,20 +254,33 @@ public sealed partial class MirrorWindow : Window
 
         if (_swapPanel is null)
         {
-            // Fixed size + Center (not Stretch): a CanvasSwapChainPanel doesn't
-            // scale its swap chain's pixels to fill a differently-sized panel —
-            // it composites them at native size anchored top-left. With Stretch
-            // alignment that meant a portrait iPhone stream (much narrower than
-            // a maximized/windowed RootGrid) sat pinned to the top-left corner
-            // instead of centered, with all the extra black space to its right —
-            // found live, reported by the user ("resta a sinistra"). RootGrid
-            // stays Stretch and black, giving the letterbox/pillarbox behind it.
-            _swapPanel = new CanvasSwapChainPanel
+            // Fixed size (native video resolution) — a CanvasSwapChainPanel
+            // doesn't scale its swap chain's pixels to fill a differently-sized
+            // panel, it composites them at native size anchored top-left. Sat
+            // directly in RootGrid with Center/Center that gave the right look
+            // ONLY while the window was >= native size (letterbox/pillarbox
+            // around a 1:1 video) — shrinking the window below native size
+            // just clipped the panel against the window edge instead of
+            // scaling it down, cutting off part of the picture (found live,
+            // reported by the user: "riduco le proporzioni e taglia parte
+            // dello schermo"). Fix: wrap the fixed-size panel in a Viewbox
+            // (Stretch="Uniform") instead of parenting it to RootGrid
+            // directly — the Viewbox scales the whole panel as a unit to fit
+            // whatever space is available, in both directions, always
+            // preserving the video's real aspect ratio; the swap chain itself
+            // keeps rendering at true native pixel resolution regardless (no
+            // resize of the actual surface on every window drag), only the
+            // on-screen presentation scales. RootGrid stays Stretch and black,
+            // still giving the letterbox/pillarbox behind it.
+            _swapPanel = new CanvasSwapChainPanel();
+            _swapViewbox = new Viewbox
             {
-                HorizontalAlignment = Microsoft.UI.Xaml.HorizontalAlignment.Center,
-                VerticalAlignment = Microsoft.UI.Xaml.VerticalAlignment.Center,
+                Stretch = Stretch.Uniform,
+                HorizontalAlignment = Microsoft.UI.Xaml.HorizontalAlignment.Stretch,
+                VerticalAlignment = Microsoft.UI.Xaml.VerticalAlignment.Stretch,
+                Child = _swapPanel,
             };
-            RootGrid.Children.Add(_swapPanel);
+            RootGrid.Children.Add(_swapViewbox);
         }
 
         if (_swapChain is not null && _surfaceWidth == width && _surfaceHeight == height) return;
