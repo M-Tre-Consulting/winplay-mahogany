@@ -29,6 +29,25 @@ public sealed class AirPlayEventChannel : IAsyncDisposable
     private readonly CancellationTokenSource _cts = new();
     private Task? _loop;
 
+    /// <summary>
+    /// Added 2026-09-04 during live debugging: this class had NO logging at
+    /// all — if a real receiver's push ever failed to decrypt (wrong keys,
+    /// a framing bug, anything), <see cref="RunAsync"/>'s loop would just
+    /// silently stop (only <see cref="OperationCanceledException"/> and
+    /// <see cref="IOException"/> were ever caught; anything else propagated
+    /// out of the unobserved background <see cref="Task.Run"/> and vanished
+    /// until <see cref="DisposeAsync"/> eventually swallowed it). This
+    /// channel's own doc comment says a receiver tears the session down if
+    /// we don't answer a push within ~25s — suspiciously close to the ~30s
+    /// after this channel opens. Fase 1 (audio) uses the identical key
+    /// wiring and has run for months against a real HomePod, but may simply
+    /// never have received an actual push on it — an audio-only session may
+    /// never trigger one, so the DECRYPT direction specifically (as opposed
+    /// to just opening the channel) may never have been genuinely exercised.
+    /// </summary>
+    public event Action<string>? Diagnostics;
+    private void Trace(string message) => Diagnostics?.Invoke(message);
+
     private AirPlayEventChannel(TcpClient tcp, byte[] readKey, byte[] writeKey)
     {
         _tcp = tcp;
@@ -48,18 +67,23 @@ public sealed class AirPlayEventChannel : IAsyncDisposable
 
     private async Task RunAsync(CancellationToken ct)
     {
+        Trace("in ascolto");
         var buf = new byte[8192];
         try
         {
             while (!ct.IsCancellationRequested)
             {
                 int n = await _stream.ReadAsync(buf, ct).ConfigureAwait(false);
-                if (n == 0) return; // receiver closed the event channel, usually a session teardown in progress
+                if (n == 0) { Trace("connessione chiusa dal ricevitore (n=0)"); return; }
+                Trace($"ricevuti {n} byte cifrati");
                 _rxEncrypted.AddRange(buf.AsSpan(0, n).ToArray());
                 while (true)
                 {
-                    byte[]? plaintext = HapFrameCodec.TryDecryptNextFrame(_readKey, ref _recvCounter, _rxEncrypted);
+                    byte[]? plaintext;
+                    try { plaintext = HapFrameCodec.TryDecryptNextFrame(_readKey, ref _recvCounter, _rxEncrypted); }
+                    catch (Exception ex) { Trace($"decrypt frame FALLITO: {ex}"); throw; }
                     if (plaintext is null) break;
+                    Trace($"frame decifrato: {plaintext.Length} byte");
                     _rxPlain.AddRange(plaintext);
                 }
                 await RespondToCompletedRequestsAsync(ct).ConfigureAwait(false);
@@ -69,9 +93,16 @@ public sealed class AirPlayEventChannel : IAsyncDisposable
         {
             // normal shutdown via DisposeAsync
         }
-        catch (IOException)
+        catch (IOException ex)
         {
             // socket torn down under us during session teardown, not actionable
+            Trace($"IOException (probabile teardown): {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            // Previously fell through uncaught and silently killed this loop —
+            // see this class's own doc comment on why that mattered.
+            Trace($"!!! ciclo eventi terminato per eccezione non gestita: {ex}");
         }
     }
 
@@ -98,11 +129,13 @@ public sealed class AirPlayEventChannel : IAsyncDisposable
             }
             int total = headEnd + 4 + Math.Max(0, contentLength);
             if (snapshot.Length < total) return; // body still arriving
+            Trace($"richiesta push ricevuta: {text[..Math.Min(headEnd, 200)].Replace("\r\n", " | ")} (CSeq={cseq}, Content-Length={contentLength})");
             _rxPlain.RemoveRange(0, total);
 
             // A bare 200 OK — no Content-Length/Audio-Latency, which can corrupt the receiver's realtime timeline.
             string resp = "RTSP/1.0 200 OK\r\nServer: AirTunes/550.10\r\n" + (cseq is not null ? $"CSeq: {cseq}\r\n" : "") + "\r\n";
             byte[] frame = HapFrameCodec.EncryptFrame(_writeKey, ref _sendCounter, Encoding.ASCII.GetBytes(resp));
+            Trace($"rispondo 200 OK (CSeq={cseq})");
             await _stream.WriteAsync(frame, ct).ConfigureAwait(false);
         }
     }
