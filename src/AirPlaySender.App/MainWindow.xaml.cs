@@ -156,6 +156,19 @@ public sealed partial class MainWindow : Window
                 }
                 Devices.Add(item);
             }
+
+            // mDNS discovery in this app is known-flaky (documented
+            // elsewhere in this project — a device can go missing from a
+            // scan for no real reason, still powered on and reachable) —
+            // found by code review: without this, a rescan that simply
+            // missed the device we're actively streaming to would silently
+            // drop it from the list, taking its own Disconnetti button with
+            // it, even though the session is still live. Keep showing it
+            // (still fully functional — Disconnetti doesn't need a fresh
+            // discovery result) until some future scan finds it again.
+            if (connectedId is not null && _activeItem is not null && !found.Any(d => d.DeviceId == connectedId))
+                Devices.Add(_activeItem);
+
             EmptyStateText.Visibility = Devices.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         }
         catch (Exception ex)
@@ -188,6 +201,25 @@ public sealed partial class MainWindow : Window
         try
         {
             await session.ConnectAsync(item.Device);
+
+            // A second Connetti click (same device again, or a different one)
+            // while this attempt was still in flight can have already
+            // superseded it (see DisconnectActiveAsync above) — found by code
+            // review: without this check, a slow ConnectAsync from an earlier
+            // click could still overwrite the UI once it finally resolved,
+            // stomping on whatever the newer attempt had already set up
+            // (including a session it had already connected successfully).
+            // Tear down cleanly and leave the UI to whoever is actually current.
+            if (!ReferenceEquals(_activeSession, session))
+            {
+                await session.DisposeAsync();
+                return;
+            }
+
+            // Applies whatever the segmented control is already set to (it persists
+            // across connect/disconnect within the same app run) to this new session —
+            // a freshly-constructed AirPlaySession otherwise defaults to duplicated audio.
+            session.SetMuteLocalPlayback(AudioTargetRadios.SelectedIndex == 1);
             item.IsConnected = true;
             item.StatusText = "In riproduzione";
             NowPlayingText.Text = $"In riproduzione su {item.Name}";
@@ -196,6 +228,11 @@ public sealed partial class MainWindow : Window
         }
         catch (Exception ex)
         {
+            // Same reasoning as above: only clear shared state if this attempt
+            // is still the one the UI is tracking — a stale failure from a
+            // click the user has since moved on from must not wipe out a
+            // newer (possibly already succeeded) session.
+            if (!ReferenceEquals(_activeSession, session)) return;
             item.StatusText = "";
             _activeSession = null;
             _activeItem = null;
@@ -267,6 +304,21 @@ public sealed partial class MainWindow : Window
         try { await _activeSession.SetVolumeAsync(e.NewValue); }
         catch { /* a missed volume update isn't worth surfacing to the user */ }
     }
+
+    /// <summary>
+    /// A choice between two destinations ("Anche sul PC" / "Solo sul
+    /// dispositivo"), not an on/off switch — deliberately a two-option
+    /// <c>RadioButtons</c> group rather than a <c>ToggleSwitch</c>: a plain
+    /// toggle read as "audio enabled/disabled" even though "off" still
+    /// played audio (just duplicated), which is exactly the confusion
+    /// reported live. (<c>Segmented</c>/<c>SegmentedItem</c> would have been
+    /// the more visually obvious "choice" control, but crashes XamlCompiler.exe
+    /// silently in this project's WindowsAppSDK 1.6 build — see the two
+    /// other known silent-crash patterns already documented in README.md's
+    /// "Come si distribuisce".) See <see cref="AirPlaySession.SetMuteLocalPlayback"/>.
+    /// </summary>
+    private void OnAudioTargetChanged(object sender, SelectionChangedEventArgs e) =>
+        _activeSession?.SetMuteLocalPlayback(AudioTargetRadios.SelectedIndex == 1);
 
     private async Task ShowErrorAsync(string title, string message)
     {

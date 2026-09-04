@@ -26,10 +26,19 @@ public sealed class WasapiLoopbackSource : IAudioCaptureSource
     public WasapiLoopbackSource()
     {
         _recorder = new WasapiRecorderBuilder().WithLoopbackCapture().Build();
-        _buffer = new BufferedWaveProvider(_recorder.WaveFormat, TimeSpan.FromSeconds(2))
+        _buffer = new BufferedWaveProvider(_recorder.WaveFormat, TimeSpan.FromMilliseconds(500))
         {
             // If the pacer falls behind (GUI stall, debugger pause), drop the
             // oldest audio rather than growing unbounded or blocking capture.
+            // Bounded to 500ms, not the 2s this used to allow: with
+            // DiscardOnBufferOverflow only kicking in once the buffer is
+            // completely full, a longer cap meant capture could silently run
+            // up to that whole amount of latency behind real time before
+            // correcting — worth tightening on its own even without a live
+            // repro, since it only ever makes worst-case staleness better,
+            // never worse (steady-state playback stays near-empty regardless
+            // of the cap, this only bounds how bad a stall can get before
+            // catching up).
             DiscardOnBufferOverflow = true,
         };
         var targetFormat = new WaveFormat(TargetSampleRate, TargetBitsPerSample, TargetChannels);

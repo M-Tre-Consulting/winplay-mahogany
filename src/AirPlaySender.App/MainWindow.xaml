@@ -105,10 +105,16 @@
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="220" />
                 </Grid.ColumnDefinitions>
                 <TextBlock x:Name="NowPlayingText" Grid.Column="0" VerticalAlignment="Center" FontWeight="SemiBold" />
-                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+                <RadioButtons x:Name="AudioTargetRadios" Grid.Column="1" VerticalAlignment="Center" Margin="0,0,20,0"
+                              MaxColumns="2" SelectedIndex="0" SelectionChanged="OnAudioTargetChanged">
+                    <RadioButton Content="Anche sul PC" />
+                    <RadioButton Content="Solo sul dispositivo" />
+                </RadioButtons>
+                <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
                     <SymbolIcon Symbol="Volume" />
                     <Slider x:Name="VolumeSlider" Width="160" Minimum="0" Maximum="100" Value="100" ValueChanged="OnVolumeChanged" />
                 </StackPanel>

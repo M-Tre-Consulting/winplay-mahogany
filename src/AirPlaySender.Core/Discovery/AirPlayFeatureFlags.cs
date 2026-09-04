@@ -93,9 +93,21 @@ public static class AirPlayFeatureParser
     {
         Match match = FeatureRegex.Match(features);
         if (!match.Success) return AirPlayFlags.None;
-        string low = match.Groups[1].Value;
-        string combined = match.Groups[2].Success ? match.Groups[2].Value + low : low;
-        return (AirPlayFlags)Convert.ToUInt64(combined, 16);
+        // Found by code review: combining the two halves via STRING
+        // concatenation (high-hex-string + low-hex-string, then parsed as
+        // one number) is only correct when the low half happens to be
+        // written as a full, zero-padded 8-digit hex string — which every
+        // existing test already assumed, so this was never caught. A real
+        // device is free to write the low half without leading zeros (e.g.
+        // "0x1F0,0x1C340" rather than "0x000001F0,0x1C340"), and string
+        // concatenation of an unpadded low half silently shifts the high
+        // half down by the missing digits, corrupting the whole bitmask —
+        // which every auth-method decision in this project depends on.
+        // Parse each half as its own number and combine numerically instead
+        // (correct regardless of how many digits either half has).
+        ulong low = Convert.ToUInt64(match.Groups[1].Value, 16);
+        ulong high = match.Groups[2].Success ? Convert.ToUInt64(match.Groups[2].Value, 16) : 0UL;
+        return (AirPlayFlags)((high << 32) | low);
     }
 
     /// <summary>Reads the "features" TXT property, falling back to "ft" (both names occur in the wild).</summary>

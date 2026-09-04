@@ -28,6 +28,27 @@ public class AirPlayFeatureParserTests
     public void ReturnsNoneForUnparsableFeatureStrings(string input) =>
         Assert.Equal(AirPlayFlags.None, AirPlayFeatureParser.ParseFeatures(input));
 
+    /// <summary>
+    /// Regression test for a real bug found by code review: combining the
+    /// two 32-bit halves via string concatenation (instead of numeric
+    /// shift+OR) only produced the right answer when the low half happened
+    /// to be a full, zero-padded 8-digit string — which every other test
+    /// above already used, hiding the bug. A device is free to omit leading
+    /// zeros on the low half; this pins the numerically-correct combination
+    /// down explicitly with an unpadded low half.
+    /// </summary>
+    [Fact]
+    public void ParsesTwoWordFeatureStringWithUnpaddedLowHalf()
+    {
+        // Same bit 43 (SupportsSystemPairing) as the padded-low-half test
+        // above, but the low half is "0x1F0" (3 digits) instead of
+        // "0x000001F0" (8 digits) — string concatenation would have shifted
+        // the high half down by 5 hex digits (20 bits) and corrupted
+        // everything; numeric combination must not care about the padding.
+        AirPlayFlags f = AirPlayFeatureParser.ParseFeatures("0x1F0,0x800");
+        Assert.True(f.HasFlag(AirPlayFlags.SupportsSystemPairing));
+    }
+
     [Fact]
     public void DevicesAdvertisingSystemPairingUseTransientAuth()
     {

@@ -41,10 +41,18 @@ public sealed class RtpAudioTransport : IAsyncDisposable
 
     private readonly byte[]?[] _backlog = new byte[BacklogSize][];
     private readonly int[] _backlogSeq = new int[BacklogSize];
+    // SendAudioPacket (the pacer's own task) writes a backlog slot at the same
+    // moment ControlLoopAsync (a separate task, reacting to a retransmit
+    // request) can read that same slot — found by code review, not live: a
+    // real but narrow race (the two fields of one slot could be observed
+    // briefly out of sync, e.g. a new seq number paired with the still-old
+    // packet bytes), which would hand back a retransmitted packet with the
+    // wrong sequence number stamped on it. Cheap enough to just always take.
+    private readonly object _backlogLock = new();
 
     private readonly System.Diagnostics.Stopwatch _clock = new();
     private CancellationTokenSource? _cts;
-    private Task? _controlLoop, _timingLoop, _pacerLoop;
+    private Task? _controlLoop, _timingLoop, _pacerLoop, _syncLoop;
     private IPcmFrameSource? _source;
 
     public int LocalControlPort => ((IPEndPoint)_controlSock.Client.LocalEndPoint!).Port;
@@ -83,7 +91,21 @@ public sealed class RtpAudioTransport : IAsyncDisposable
         _timingLoop = Task.Run(() => TimingLoopAsync(_cts.Token));
     }
 
-    /// <summary>Anchors the RTP timeline to wall-clock NTP and sends the first (marker-bit) sync packet. Call once, right before <see cref="StartPacing"/>.</summary>
+    private static readonly TimeSpan SyncInterval = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// Anchors the RTP timeline to wall-clock NTP, sends the first (marker-bit)
+    /// sync packet, and starts the recurring 1Hz re-sync this class's own doc
+    /// comment already promised ("1Hz NTP sync packets") but never actually
+    /// sent — found by code review: <see cref="SendSyncPacket"/> was only ever
+    /// called once, from right here, with no periodic loop anywhere calling it
+    /// again. Real RAOP receivers use these to keep their playback clock
+    /// anchored to the sender's over a session's whole lifetime; without them,
+    /// ordinary clock drift between sender and receiver (routine — different
+    /// crystal oscillators) goes uncorrected for as long as the session runs,
+    /// which is exactly the kind of slow-building desync/glitch a short test
+    /// session would never surface. Call once, right before <see cref="StartPacing"/>.
+    /// </summary>
     public void AnchorStreamClock()
     {
         _startTs = Ntp.ToRtpTimestamp(Ntp.Now(), SampleRate);
@@ -91,6 +113,20 @@ public sealed class RtpAudioTransport : IAsyncDisposable
         _firstAudio = true;
         _clock.Restart();
         SendSyncPacket(first: true);
+
+        _cts ??= new CancellationTokenSource();
+        _syncLoop = Task.Run(() => SyncLoopAsync(_cts.Token));
+    }
+
+    private async Task SyncLoopAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(SyncInterval);
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+                SendSyncPacket(first: false);
+        }
+        catch (OperationCanceledException) { }
     }
 
     /// <summary>Starts the ~8ms pacer that pulls frames from <paramref name="source"/> and puts them on the wire in real time.</summary>
@@ -172,8 +208,11 @@ public sealed class RtpAudioTransport : IAsyncDisposable
         _audioSock.Send(pkt, new IPEndPoint(_remoteHost, _serverPort));
 
         int slot = _seq & (BacklogSize - 1);
-        _backlog[slot] = pkt;
-        _backlogSeq[slot] = _seq;
+        lock (_backlogLock)
+        {
+            _backlog[slot] = pkt;
+            _backlogSeq[slot] = _seq;
+        }
 
         _firstAudio = false;
         _seq++;
@@ -218,9 +257,13 @@ public sealed class RtpAudioTransport : IAsyncDisposable
                 {
                     ushort s = (ushort)(lostSeq + i);
                     int slot = s & (BacklogSize - 1);
-                    if (_backlogSeq[slot] != s || _backlog[slot] is null) continue; // aged out of the backlog
+                    byte[]? original;
+                    lock (_backlogLock)
+                    {
+                        original = _backlogSeq[slot] == s ? _backlog[slot] : null;
+                    }
+                    if (original is null) continue; // aged out of the backlog
 
-                    byte[] original = _backlog[slot]!;
                     var resp = new byte[4 + original.Length];
                     resp[0] = 0x80;
                     resp[1] = 0xD6;
@@ -265,7 +308,7 @@ public sealed class RtpAudioTransport : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         if (_cts is not null) await _cts.CancelAsync().ConfigureAwait(false);
-        foreach (Task? t in new[] { _controlLoop, _timingLoop, _pacerLoop })
+        foreach (Task? t in new[] { _controlLoop, _timingLoop, _pacerLoop, _syncLoop })
             if (t is not null) { try { await t.ConfigureAwait(false); } catch { } }
         _audioSock.Dispose();
         _controlSock.Dispose();

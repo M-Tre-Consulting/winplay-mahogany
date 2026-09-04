@@ -37,6 +37,7 @@ public sealed class AirPlaySession : IAsyncDisposable
     private uint _sessionId;
     private bool _airplay2;
     private double? _pendingVolumePercent;
+    private readonly LocalPlaybackMuter _muter = new();
 
     public AirPlaySessionState State { get; private set; } = AirPlaySessionState.Idle;
     public AirPlayDevice? Device { get; private set; }
@@ -64,31 +65,52 @@ public sealed class AirPlaySession : IAsyncDisposable
         _airplay2 = device.IsAirPlay2;
         State = AirPlaySessionState.Connecting;
 
-        var rnd = Random.Shared;
-        _sessionId = (uint)rnd.Next();
-        string dacpId = ((ulong)rnd.NextInt64()).ToString("X");
-        uint activeRemote = (uint)rnd.Next();
+        try
+        {
+            var rnd = Random.Shared;
+            _sessionId = (uint)rnd.Next();
+            string dacpId = ((ulong)rnd.NextInt64()).ToString("X");
+            uint activeRemote = (uint)rnd.Next();
 
-        _rtsp = await RtspConnection.ConnectAsync(device.Host, device.Port, dacpId, activeRemote, ct).ConfigureAwait(false);
-        Trace($"TCP connesso a {device.Host}:{device.Port}, sessionId={_sessionId:X8} auth={(_airplay2 ? device.DetermineAuthMethod().ToString() : "nessuno (AirPlay 1)")}");
+            _rtsp = await RtspConnection.ConnectAsync(device.Host, device.Port, dacpId, activeRemote, ct).ConfigureAwait(false);
+            Trace($"TCP connesso a {device.Host}:{device.Port}, sessionId={_sessionId:X8} auth={(_airplay2 ? device.DetermineAuthMethod().ToString() : "nessuno (AirPlay 1)")}");
 
-        State = AirPlaySessionState.Pairing;
-        PairingResult? pairing = _airplay2 ? await RunPairingWithFallbackAsync(device, ct).ConfigureAwait(false) : null;
-        if (pairing is not null) Trace($"Pairing completato, sharedSecret={pairing.SharedSecret.Length} byte");
+            State = AirPlaySessionState.Pairing;
+            PairingResult? pairing = _airplay2 ? await RunPairingWithFallbackAsync(device, ct).ConfigureAwait(false) : null;
+            if (pairing is not null) Trace($"Pairing completato, sharedSecret={pairing.SharedSecret.Length} byte");
 
-        State = AirPlaySessionState.Handshake;
-        _audio = new RtpAudioTransport(device.Host, _sessionId, pairing?.AudioKey);
-        // Must be listening before the session SETUP announces our timingPort — see StartResponders' doc comment.
-        _audio.StartResponders();
+            State = AirPlaySessionState.Handshake;
+            _audio = new RtpAudioTransport(device.Host, _sessionId, pairing?.AudioKey);
+            // Must be listening before the session SETUP announces our timingPort — see StartResponders' doc comment.
+            _audio.StartResponders();
 
-        if (_airplay2)
-            await RunAirPlay2HandshakeAsync(device, pairing!, ct).ConfigureAwait(false);
-        else
-            await RunAirPlay1HandshakeAsync(ct).ConfigureAwait(false);
+            if (_airplay2)
+                await RunAirPlay2HandshakeAsync(device, pairing!, ct).ConfigureAwait(false);
+            else
+                await RunAirPlay1HandshakeAsync(ct).ConfigureAwait(false);
 
-        await StartStreamingAsync(ct).ConfigureAwait(false);
-        State = AirPlaySessionState.Streaming;
-        Trace("Streaming avviato");
+            await StartStreamingAsync(ct).ConfigureAwait(false);
+            State = AirPlaySessionState.Streaming;
+            Trace("Streaming avviato");
+        }
+        catch
+        {
+            // Found by code review: a failed connect attempt (rejected
+            // pairing, a receiver that 400s the handshake, a network hiccup —
+            // all routine, not rare) used to leave State stuck at whatever
+            // intermediate stage it failed on, never back at Idle — and
+            // MainWindow's own catch block just drops the AirPlaySession
+            // reference on a failed ConnectAsync without ever calling
+            // DisposeAsync. Together that leaked every socket/background loop
+            // this got through starting (the RTSP TCP connection,
+            // RtpAudioTransport's three UDP sockets plus its responder
+            // loops) forever, one more leak per failed attempt. DisposeAsync
+            // already tears all of that down defensively (every field it
+            // touches is null-checked) and resets State to Idle — just route
+            // through it here too, so no caller has to remember to.
+            await DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
     }
 
     // ── pairing, with the receiver-driven fallbacks real devices need ────
@@ -373,11 +395,17 @@ public sealed class AirPlaySession : IAsyncDisposable
         _sessionCts = new CancellationTokenSource();
         _feedbackLoop = Task.Run(() => FeedbackLoopAsync(_sessionCts.Token), CancellationToken.None);
 
-        // AirPlay-2 receivers can otherwise sit at their own (possibly
-        // muted) default volume — audible-by-default matches what a user
-        // expects from "connect and it plays".
-        if (_airplay2 && _pendingVolumePercent is null) await SetVolumeAsync(100, ct).ConfigureAwait(false);
-        else if (_pendingVolumePercent is { } pct) await SetVolumeAsync(pct, ct).ConfigureAwait(false);
+        if (MuteLocalPlayback) _muter.Mute();
+
+        // A receiver can otherwise sit at its own (possibly muted) default
+        // volume — audible-by-default matches what a user expects from
+        // "connect and it plays". Found by code review: this used to only
+        // apply `if (_airplay2)`, leaving AirPlay 1 receivers (older
+        // AirPort-Express-style devices) with exactly the silent-by-default
+        // problem this was written to avoid in the first place — SET_PARAMETER
+        // volume is equally valid RAOP/AirPlay 1, no reason to special-case it.
+        if (_pendingVolumePercent is null) await SetVolumeAsync(100, ct).ConfigureAwait(false);
+        else await SetVolumeAsync(_pendingVolumePercent.Value, ct).ConfigureAwait(false);
     }
 
     private async Task FeedbackLoopAsync(CancellationToken ct)
@@ -393,6 +421,27 @@ public sealed class AirPlaySession : IAsyncDisposable
             }
         }
         catch (OperationCanceledException) { }
+    }
+
+    /// <summary>
+    /// True once the local PC output has been muted so only the AirPlay
+    /// target plays this session's audio ("solo sul dispositivo" in the UI)
+    /// — false (the default) leaves it duplicated on both, matching the
+    /// behavior every version of this app had before this toggle existed.
+    /// </summary>
+    public bool MuteLocalPlayback { get; private set; }
+
+    /// <summary>
+    /// Call any time — before <see cref="ConnectAsync"/> (applied once
+    /// streaming starts) or live, mid-session (applied immediately). See
+    /// <see cref="LocalPlaybackMuter"/> for why this doesn't also silence
+    /// what reaches the AirPlay target.
+    /// </summary>
+    public void SetMuteLocalPlayback(bool mute)
+    {
+        MuteLocalPlayback = mute;
+        if (State != AirPlaySessionState.Streaming) return; // StartStreamingAsync applies it once streaming begins
+        if (mute) _muter.Mute(); else _muter.Restore();
     }
 
     /// <summary>0-100%; AirPlay maps 0% to its dedicated mute sentinel (-144dBFS), not to -30dBFS.</summary>
@@ -421,6 +470,7 @@ public sealed class AirPlaySession : IAsyncDisposable
         }
         catch { /* best-effort — we're tearing down regardless */ }
 
+        _muter.Dispose(); // Dispose() calls Restore() internally, then releases the COM device handle
         if (_source is not null) { _source.Stop(); await _source.DisposeAsync().ConfigureAwait(false); }
         if (_audio is not null) await _audio.DisposeAsync().ConfigureAwait(false);
         if (_eventChannel is not null) await _eventChannel.DisposeAsync().ConfigureAwait(false);
