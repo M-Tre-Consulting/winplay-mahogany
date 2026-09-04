@@ -141,6 +141,17 @@ public sealed class RtspConnection : IAsyncDisposable
     public Task<RtspResponse> SendFpSetupAsync(byte[] body, CancellationToken ct = default) =>
         SendAp2RtspAsync("POST", "/fp-setup", "application/octet-stream", body, ct: ct);
 
+    /// <summary>
+    /// <c>POST /auth-setup</c> — MFi-SAP authentication (encryption type 4 —
+    /// "MFiSAP, 3rd-party devices" per the unofficial AirPlay spec's <c>et</c>
+    /// table), the alternative to <c>/fp-setup</c> a device that doesn't
+    /// advertise the FairPlay feature bit (14) but does advertise
+    /// SupportsUnifiedPairSetupAndMFi (51) is expected to use instead — same
+    /// RTSP/1.0 request family as fp-setup/GET-info/SETUP.
+    /// </summary>
+    public Task<RtspResponse> SendAuthSetupAsync(byte[] body, CancellationToken ct = default) =>
+        SendAp2RtspAsync("POST", "/auth-setup", "application/octet-stream", body, ct: ct);
+
     /// <summary>AirPlay-2 realtime handshake: GET /info and the binary-plist SETUP/RECORD — RTSP *methods* on the <c>rtsp://</c> URI, not an HTTP path (which 404s), but the reply carries a plist body.</summary>
     public Task<RtspResponse> SendAp2RtspAsync(string method, string uri, string? contentType = null, byte[]? body = null, bool isStreamSetup = false, CancellationToken ct = default)
     {
