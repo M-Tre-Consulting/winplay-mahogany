@@ -57,6 +57,12 @@ public partial class App : Application
                     ? cliArgs[mirrorTestIdx + 2] : null;
                 return;
             }
+            if (replayRealIdx >= 0 && replayRealIdx + 1 < cliArgs.Length)
+            {
+                string nameFilter = cliArgs[replayRealIdx + 1];
+                    ? cliArgs[replayRealIdx + 2] : null;
+                return;
+            }
         }
 
         StartupRegistration.EnsureRegistered();
