@@ -138,8 +138,22 @@ public sealed class RtspConnection : IAsyncDisposable
     /// sitting right alongside), not the separate HAP pairing POST family
     /// pair-setup/pair-verify belong to.
     /// </summary>
+    /// <summary>
+    /// <c>X-Apple-ET: 32</c> — found live (2026-09-04) on a REAL fp-setup
+    /// request, captured by mirroring a real Mac (macOS 26) and a real
+    /// iPhone to this project's OWN receiver (which decrypts everything, so
+    /// the request is visible in full): every genuine sender sends this
+    /// header on <c>/fp-setup</c>, and the mirroring SETUP plist's own
+    /// <c>et</c> field is <c>32</c> too (not the audio-context 0/1/3/4/5 this
+    /// project assumed earlier tonight, going by the unofficial spec's *audio*
+    /// <c>et</c> table — mirroring apparently uses a different value
+    /// entirely). Every earlier live attempt against a real receiver omitted
+    /// this header — a very plausible reason for the flat HTTP 403 it always got.
+    /// </summary>
+    private static readonly (string Name, string Value)[] FpSetupHeaders = [("X-Apple-ET", "32")];
+
     public Task<RtspResponse> SendFpSetupAsync(byte[] body, CancellationToken ct = default) =>
-        SendAp2RtspAsync("POST", "/fp-setup", "application/octet-stream", body, ct: ct);
+        SendAp2RtspAsync("POST", "/fp-setup", "application/octet-stream", body, extraHeaders: FpSetupHeaders, ct: ct);
 
     /// <summary>
     /// <c>POST /auth-setup</c> — MFi-SAP authentication (encryption type 4 —
@@ -153,7 +167,8 @@ public sealed class RtspConnection : IAsyncDisposable
         SendAp2RtspAsync("POST", "/auth-setup", "application/octet-stream", body, ct: ct);
 
     /// <summary>AirPlay-2 realtime handshake: GET /info and the binary-plist SETUP/RECORD — RTSP *methods* on the <c>rtsp://</c> URI, not an HTTP path (which 404s), but the reply carries a plist body.</summary>
-    public Task<RtspResponse> SendAp2RtspAsync(string method, string uri, string? contentType = null, byte[]? body = null, bool isStreamSetup = false, CancellationToken ct = default)
+    public Task<RtspResponse> SendAp2RtspAsync(string method, string uri, string? contentType = null, byte[]? body = null, bool isStreamSetup = false,
+        IReadOnlyList<(string Name, string Value)>? extraHeaders = null, CancellationToken ct = default)
     {
         var sb = new StringBuilder();
         sb.Append(method).Append(' ').Append(uri).Append(" RTSP/1.0\r\n");
@@ -162,6 +177,8 @@ public sealed class RtspConnection : IAsyncDisposable
         sb.Append("DACP-ID: ").Append(DacpId).Append("\r\n");
         sb.Append("Active-Remote: ").Append(ActiveRemote).Append("\r\n");
         sb.Append("Client-Instance: ").Append(DacpId).Append("\r\n");
+        if (extraHeaders is not null)
+            foreach ((string name, string value) in extraHeaders) sb.Append(name).Append(": ").Append(value).Append("\r\n");
         // Deliberately no X-Apple-Client-Name / X-Apple-StreamID here (an
         // earlier version sent both, using `isStreamSetup` for the latter):
         // confirmed against a real HomePod that a "full" audio-streaming

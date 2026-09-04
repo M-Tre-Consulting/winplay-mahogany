@@ -90,7 +90,12 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
                     continue;
                 }
 
-                Trace($"{request.Method} {request.Url} (CSeq {request.CSeq})");
+                // Full header dump on SETUP specifically — temporary, comparing
+                // a real sender's exact headers against this project's own
+                // accepted by fp-setup but still HTTP 400s — see
+                Trace(request.Method == "SETUP"
+                    ? $"{request.Method} {request.Url} (CSeq {request.CSeq}) headers=[{string.Join(" | ", request.Headers.Select(h => $"{h.Key}={h.Value}"))}]"
+                    : $"{request.Method} {request.Url} (CSeq {request.CSeq})");
                 var remoteAddr = ((IPEndPoint)client.Client.RemoteEndPoint!).Address;
                 (byte[] responseBytes, bool closeAfter) = BuildResponse(request, pairing, hapPairSetup, fairplay, mirror, remoteAddr);
                 await stream.WriteAsync(responseBytes, ct).ConfigureAwait(false);
@@ -430,8 +435,16 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
         return ([.. Encoding.ASCII.GetBytes(sb.ToString()), .. body], false);
     }
 
-    private static (byte[], bool) BuildFpSetupResponse(RtspRequest request, FairPlaySetupSession fairplay)
+    /// <summary>
+    /// Logs the raw request (headers + hex body) before handling it — ground
+    /// truth for what a REAL, current sender (a real Mac/iPhone) actually
+    /// (which gets HTTP 403 from real receivers on this same path — see
+    /// comparison; not meant to stay this verbose long-term.
+    /// </summary>
+    private (byte[], bool) BuildFpSetupResponse(RtspRequest request, FairPlaySetupSession fairplay)
     {
+        string headers = string.Join(" | ", request.Headers.Select(h => $"{h.Key}={h.Value}"));
+        Trace($"  fp-setup RICHIESTA REALE: headers=[{headers}] body({request.Body.Length}B)={Convert.ToHexString(request.Body)}");
         byte[]? body = fairplay.Handle(request.Body);
         if (body is null) return (BuildStatusResponse(request, 400, "Bad Request"), true);
         return (BuildOctetStreamResponse(request, body), false);
