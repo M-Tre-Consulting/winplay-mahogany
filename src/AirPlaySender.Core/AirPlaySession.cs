@@ -471,10 +471,39 @@ public sealed class AirPlaySession : IAsyncDisposable
         catch { /* best-effort — we're tearing down regardless */ }
 
         _muter.Dispose(); // Dispose() calls Restore() internally, then releases the COM device handle
-        if (_source is not null) { _source.Stop(); await _source.DisposeAsync().ConfigureAwait(false); }
-        if (_audio is not null) await _audio.DisposeAsync().ConfigureAwait(false);
-        if (_eventChannel is not null) await _eventChannel.DisposeAsync().ConfigureAwait(false);
-        if (_rtsp is not null) await _rtsp.DisposeAsync().ConfigureAwait(false);
+
+        // Found by code review: unlike the TEARDOWN send above, these four teardown
+        // steps had no try/catch at all — and both UI call sites that reach this
+        // method (OnDisconnectClicked, and the pre-connect disconnect in
+        // OnConnectClicked) call it with no try/catch of their own either, since
+        // DisposeAsync failing was never expected to happen. It can: WASAPI's
+        // StopRecording/dispose can throw if the default render device changes or
+        // disappears (a Bluetooth headset dropping, a dock unplugged, an HDMI
+        // output going to sleep) at the exact moment a session is torn down — and
+        // an exception from an async void UI event handler crashes the whole app,
+        // not just this cleanup. Each step is now best-effort and independent, so
+        // one throwing (most likely the WASAPI one) can never stop the rest from
+        // running or escape to the caller.
+        if (_source is not null)
+        {
+            try { _source.Stop(); await _source.DisposeAsync().ConfigureAwait(false); }
+            catch { /* best-effort — we're tearing down regardless */ }
+        }
+        if (_audio is not null)
+        {
+            try { await _audio.DisposeAsync().ConfigureAwait(false); }
+            catch { /* best-effort — we're tearing down regardless */ }
+        }
+        if (_eventChannel is not null)
+        {
+            try { await _eventChannel.DisposeAsync().ConfigureAwait(false); }
+            catch { /* best-effort — we're tearing down regardless */ }
+        }
+        if (_rtsp is not null)
+        {
+            try { await _rtsp.DisposeAsync().ConfigureAwait(false); }
+            catch { /* best-effort — we're tearing down regardless */ }
+        }
         _sessionCts?.Dispose();
 
         Disconnected?.Invoke();
