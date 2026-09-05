@@ -129,16 +129,43 @@ internal sealed class H264Mft : IDisposable
         t.Dispose();
     }
 
+    // Input sample/buffer, allocated once and grown only if a bigger access
+    // unit needs it (an IDR runs several times the size of an ordinary
+    // P-frame) — found by code review: unlike the OUTPUT side just below
+    // (EnsureOutputBuffer, already reused for exactly this reason), Decode
+    // was calling MFCreateSample/MFCreateMemoryBuffer fresh on every single
+    // call, 60 times a second — the identical COM-allocation-churn cost
+    // already identified and fixed on the output side, just left standing
+    // on the input side. Safe for the same reason the output buffer already
+    // is: this MFT runs synchronously (ProcessInput has fully consumed the
+    // sample by the time it returns — the DrainOutputs() call right after
+    // is what pulls the frame(s) that produced), so nothing keeps a
+    // reference to it once Decode returns.
+    private IMFSample? _inSample;
+    private IMFMediaBuffer? _inBuffer;
+    private int _inBufferCapacity;
+
+    private void EnsureInputBuffer(int need)
+    {
+        if (_inSample is not null && _inBufferCapacity >= need) return;
+        _inBuffer?.Dispose();
+        _inSample?.Dispose();
+        _inBuffer = MediaFactory.MFCreateMemoryBuffer(need);
+        _inSample = MediaFactory.MFCreateSample();
+        _inSample.AddBuffer(_inBuffer);
+        _inBufferCapacity = need;
+    }
+
     /// <summary>Feed one Annex-B access unit and blit out every frame it completes.</summary>
     public void Decode(byte[] annexB, long ptsHns)
     {
-        IMFSample sample = MediaFactory.MFCreateSample();
-        IMFMediaBuffer buffer = MediaFactory.MFCreateMemoryBuffer(annexB.Length);
+        EnsureInputBuffer(annexB.Length);
+        IMFSample sample = _inSample!;
+        IMFMediaBuffer buffer = _inBuffer!;
         buffer.Lock(out IntPtr p, out _, out _);
         Marshal.Copy(annexB, 0, p, annexB.Length);
         buffer.Unlock();
         buffer.CurrentLength = annexB.Length;
-        sample.AddBuffer(buffer);
         sample.SampleTime = ptsHns;
         sample.SampleDuration = 166_667;
 
@@ -152,9 +179,6 @@ internal sealed class H264Mft : IDisposable
             _mft.ProcessInput(0, sample, 0);
         }
         DrainOutputs();
-
-        buffer.Dispose();
-        sample.Dispose();
     }
 
     // Output sample/buffer for the software decoder, allocated once and reused every
@@ -291,6 +315,8 @@ internal sealed class H264Mft : IDisposable
         try { _mft?.ProcessMessage(TMessageType.MessageNotifyEndStreaming, UIntPtr.Zero); } catch { }
         try { _outBuffer?.Dispose(); } catch { }
         try { _outSample?.Dispose(); } catch { }
+        try { _inBuffer?.Dispose(); } catch { }
+        try { _inSample?.Dispose(); } catch { }
         try { _mft?.Dispose(); } catch { }
         if (_mfStarted) { try { MediaFactory.MFShutdown(); } catch { } _mfStarted = false; }
     }
