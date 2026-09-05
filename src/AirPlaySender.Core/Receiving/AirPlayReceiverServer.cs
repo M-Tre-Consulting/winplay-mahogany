@@ -90,9 +90,8 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
                     continue;
                 }
 
-                // Full header dump on SETUP specifically — temporary, comparing
-                // a real sender's exact headers against this project's own
-                // accepted by fp-setup but still HTTP 400s — see
+                // Full header dump on SETUP specifically — useful ground truth for
+                // what a real sender (iPhone/Mac) actually sends here.
                 Trace(request.Method == "SETUP"
                     ? $"{request.Method} {request.Url} (CSeq {request.CSeq}) headers=[{string.Join(" | ", request.Headers.Select(h => $"{h.Key}={h.Value}"))}]"
                     : $"{request.Method} {request.Url} (CSeq {request.CSeq})");
@@ -438,8 +437,7 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
     /// <summary>
     /// Logs the raw request (headers + hex body) before handling it — ground
     /// truth for what a REAL, current sender (a real Mac/iPhone) actually
-    /// (which gets HTTP 403 from real receivers on this same path — see
-    /// comparison; not meant to stay this verbose long-term.
+    /// sends here.
     /// </summary>
     private (byte[], bool) BuildFpSetupResponse(RtspRequest request, FairPlaySetupSession fairplay)
     {

@@ -38,12 +38,12 @@ public sealed class AirPlayEventChannel : IAsyncDisposable
     /// out of the unobserved background <see cref="Task.Run"/> and vanished
     /// until <see cref="DisposeAsync"/> eventually swallowed it). This
     /// channel's own doc comment says a receiver tears the session down if
-    /// we don't answer a push within ~25s — suspiciously close to the ~30s
-    /// after this channel opens. Fase 1 (audio) uses the identical key
-    /// wiring and has run for months against a real HomePod, but may simply
-    /// never have received an actual push on it — an audio-only session may
-    /// never trigger one, so the DECRYPT direction specifically (as opposed
-    /// to just opening the channel) may never have been genuinely exercised.
+    /// we don't answer a push within ~25s. Fase 1 (audio) uses the identical
+    /// key wiring and has run for months against a real HomePod, but may
+    /// simply never have received an actual push on it — an audio-only
+    /// session may never trigger one, so the DECRYPT direction specifically
+    /// (as opposed to just opening the channel) may never have been
+    /// genuinely exercised.
     /// </summary>
     public event Action<string>? Diagnostics;
     private void Trace(string message) => Diagnostics?.Invoke(message);

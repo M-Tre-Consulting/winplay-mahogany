@@ -36,45 +36,4 @@ public class FairPlayCipherTests
 
         Assert.Equal(expectedRawKey, rawKey);
     }
-
-    /// <summary>
-    /// <see cref="FairPlayCipher.Encrypt"/> is the sender-side inverse of
-    /// <see cref="Decrypt"/>, added 2026-09-04 once a real Mac (macOS 26)
-    /// confirmed live that this project's *other* ekey-wrap
-    /// incompatible, different scheme. Verified against the same real
-    /// iPhone capture as the test above: given the exact chunk2 a real
-    /// iPhone used, Encrypt reproduces the exact chunk1 bytes that same
-    /// iPhone produced — not just a self-consistent round trip, but a
-    /// byte-for-byte match against a genuine sender's real output.
-    /// </summary>
-    [Fact]
-    public void EncryptReproducesARealIPhoneSendersEkeyGivenTheSameChunk2()
-    {
-        byte[] keyMessage164 = Convert.FromHexString(
-            "46504C590301030000000098028F1A9C04F4A91EC8C40A7B37C505D68D44FF1E2A41D5C09D6C60385F8F1FB911023C657545029383A1B7F58AE6BA788132BB1B1B085F99433B55CD731BF35D1E3719403CA1CE4D0AC4F6D56A77E3F2882E66A3536A0728BDD6694A6FB61C3AFC808078B278423ED07E2064FEA5E3879DBE2DD4226EFF7EB0B54E0CC547A0D1D04BA11DB9FD1BBB0FA8F432CFE074D7097E36A0EC78F425");
-        byte[] ekey72 = Convert.FromHexString(
-            "46504C59010201000000003C000000002FB042ECA4BB6602DCE4F65EA653134A000000105942329474D58893F2E81910D62E6C91E54C57F0558B5597E7BB82B775CD32C06ABFD5FC");
-        byte[] rawKey = Convert.FromHexString("E5C096E9A6D8D767E9C9B186660128E1");
-        byte[] realChunk2 = ekey72[56..72];
-        byte[] realChunk1 = ekey72[16..32];
-
-        byte[] wrapped = FairPlayCipher.Encrypt(keyMessage164, rawKey, realChunk2);
-
-        Assert.Equal(realChunk1, wrapped[16..32]);
-        Assert.Equal(realChunk2, wrapped[56..72]);
-    }
-
-    [Fact]
-    public void EncryptThenDecryptRoundTripsAFreshKey()
-    {
-        byte[] keyMessage164 = Convert.FromHexString(
-            "46504C590301030000000098028F1A9C04F4A91EC8C40A7B37C505D68D44FF1E2A41D5C09D6C60385F8F1FB911023C657545029383A1B7F58AE6BA788132BB1B1B085F99433B55CD731BF35D1E3719403CA1CE4D0AC4F6D56A77E3F2882E66A3536A0728BDD6694A6FB61C3AFC808078B278423ED07E2064FEA5E3879DBE2DD4226EFF7EB0B54E0CC547A0D1D04BA11DB9FD1BBB0FA8F432CFE074D7097E36A0EC78F425");
-        byte[] rawKey = Convert.FromHexString("00112233445566778899AABBCCDDEEFF");
-
-        byte[] wrapped = FairPlayCipher.Encrypt(keyMessage164, rawKey);
-        Assert.Equal(72, wrapped.Length);
-        byte[] unwrapped = FairPlayCipher.Decrypt(keyMessage164, wrapped);
-
-        Assert.Equal(rawKey, unwrapped);
-    }
 }

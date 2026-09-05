@@ -63,7 +63,7 @@ public sealed class AirPlayDiscovery
             // role — confirmed live: a real AirPlay TV advertises ONLY
             // _airplay._tcp, no _raop._tcp at all) has no RAOP endpoint. Only
             // requiring RAOP here silently dropped every such device from
-            // discovery — found live, not by inspection: this device search
+            // discovery — found live, not by inspection.
             if (raop is null && airplay is null) continue;
 
             var merged = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);

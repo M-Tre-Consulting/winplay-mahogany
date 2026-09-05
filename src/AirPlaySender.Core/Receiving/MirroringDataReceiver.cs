@@ -144,27 +144,8 @@ public sealed class MirroringDataReceiver : IAsyncDisposable
         }
     }
 
-    // TEMPORARY (2026-09-04): dumps the first real decrypted key frame this
-    // receiver ever sees (Annex-B, SPS/PPS already prepended — a genuine
-    // access unit a real Apple encoder produced) to a fixed scratch file, so
-    // key-derivation variant tried) is caused by the crypto/transport layer
-    // or by something in our own encoder's bitstream. Remove once that's settled.
-    private static bool s_dumpedKeyFrame;
-    private static void DumpKeyFrameOnce(MirroringVideoFrame frame)
-    {
-        if (!frame.IsKeyFrame || s_dumpedKeyFrame) return;
-        s_dumpedKeyFrame = true;
-        try
-        {
-            string path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "winplay-real-keyframe.h264");
-            System.IO.File.WriteAllBytes(path, frame.AnnexB);
-        }
-        catch { /* best-effort diagnostic, never break real mirroring over it */ }
-    }
-
     private void EmitFrame(MirroringVideoFrame frame)
     {
-        DumpKeyFrameOnce(frame);
         lock (_emitGate)
         {
             if (frame.IsKeyFrame) _replaySinceKeyFrame.Clear();

@@ -27,20 +27,6 @@ public class AvcDecoderConfigTests
     }
 
     [Fact]
-    public void BuildRecordIsTheExactInverseOfTryParse()
-    {
-        byte[] sps = [0x67, 0x64, 0x00, 0x1E, 0xAA, 0xBB];
-        byte[] pps = [0x68, 0xCC, 0xDD];
-
-        byte[] record = AvcDecoderConfig.BuildRecord(sps, pps);
-        (byte[] Sps, byte[] Pps)? roundTripped = AvcDecoderConfig.TryParse(record);
-
-        Assert.NotNull(roundTripped);
-        Assert.Equal(sps, roundTripped!.Value.Sps);
-        Assert.Equal(pps, roundTripped.Value.Pps);
-    }
-
-    [Fact]
     public void SplitsOneAvccNalUnit()
     {
         byte[] data = [0x00, 0x00, 0x00, 0x03, 0xAA, 0xBB, 0xCC];

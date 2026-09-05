@@ -34,11 +34,10 @@ public sealed class PairingIdentity
     };
 
     /// <summary>
-    /// This app's one persistent identity, shared across every kind of session
-    /// key pair regardless of what's being streamed, so a receiver that's
-    /// already paired for audio must see the exact same identity when this app
-    /// later mirrors to it, not a second, unrelated one. Loads the stored one if
-    /// present, otherwise generates and persists a fresh one.
+    /// This app's one persistent controller identity for the audio sender (Fase 1)
+    /// — HAP identifies the controller by this key pair regardless of which
+    /// receiver it's pairing with. Loads the stored one if present, otherwise
+    /// generates and persists a fresh one.
     /// </summary>
     public static PairingIdentity LoadOrCreate(CredentialStore store)
     {

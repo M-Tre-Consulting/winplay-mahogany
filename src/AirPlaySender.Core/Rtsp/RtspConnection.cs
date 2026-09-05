@@ -129,7 +129,7 @@ public sealed class RtspConnection : IAsyncDisposable
     }
 
     /// <summary>
-    /// <c>POST /fp-setup</c> — the FairPlay round-trip (see
+    /// <c>POST /fp-setup</c> — the FairPlay round-trip. First attempt against a real
     /// device (a Hisense AirPlay-2 TV) used <see cref="SendPairingPostAsync"/>'s
     /// HTTP/1.1 shape and got a flat HTTP 404 — the request never even routed.
     /// This is the "realtime handshake" family instead (<see
