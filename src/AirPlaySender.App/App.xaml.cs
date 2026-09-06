@@ -86,6 +86,7 @@ public partial class App : Application
 
             _advertiser = new AirPlayMirroringAdvertiser(MirroringPort, identity);
             _advertiser.Start();
+            AppLog.Write($"Modello AirPlay annunciato: {AirPlayMirroringAdvertiser.Model}");
 
             _receiverServer = new AirPlayReceiverServer(MirroringPort, identity, deviceId);
             // Forwards every RTSP-dispatch trace AND (already re-forwarded from

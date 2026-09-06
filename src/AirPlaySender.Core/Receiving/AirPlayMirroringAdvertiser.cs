@@ -23,15 +23,30 @@ namespace AirPlaySender.Core.Receiving;
 ///     ever built this project.
 ///   - <c>pk</c>: UxPlay's own Ed25519 long-term public key; ours is
 ///     <see cref="ReceiverIdentity.PublicKeyHex"/>.
-/// <c>model</c> is kept as UxPlay's "AppleTV3,2" rather than something
-/// honestly PC-shaped: real receivers gate mirroring capabilities/codec
-/// choices on a recognized Apple model string, and this is the value
-/// confirmed to get full mirroring support offered by a real iPhone.
+/// <c>model</c> must be a recognized Apple model string — real senders gate
+/// mirroring capabilities and, crucially, the H.264 encode bitrate/resolution
+/// on it. This project long used UxPlay's <c>AppleTV3,2</c> (Apple TV 3, 2013),
+/// which works but makes an iPhone/Mac pick a deliberately conservative,
+/// low-bitrate encode. <see cref="Model"/> now defaults to <c>AppleTV6,2</c>
+/// (Apple TV 4K, 2017) to test whether identifying as a 4K-class receiver makes
+/// a sender offer a sharper, higher-bitrate stream. This is an experiment:
+/// revert to <c>AppleTV3,2</c> (or set the <c>WINPLAY_MODEL</c> env var) if a
+/// modern model trips a sender into the modern HAP pair-setup path this
+/// receiver doesn't fully implement yet.
 /// </summary>
 public sealed class AirPlayMirroringAdvertiser : IDisposable
 {
     private const string AirPlayServiceType = "_airplay._tcp";
-    public const string Model = "AppleTV3,2";
+
+    /// <summary>
+    /// The Apple model string this receiver claims, in both the mDNS TXT record
+    /// and <c>GET /info</c> (one source of truth so they can't disagree).
+    /// Overridable at launch with the <c>WINPLAY_MODEL</c> environment variable
+    /// so a live test can sweep models without a rebuild — see the class doc
+    /// comment for why the default moved off <c>AppleTV3,2</c>.
+    /// </summary>
+    public static readonly string Model =
+        Environment.GetEnvironmentVariable("WINPLAY_MODEL") is { Length: > 0 } m ? m : "AppleTV6,2";
 
     private readonly ServiceDiscovery _discovery;
     private readonly ServiceProfile _profile;

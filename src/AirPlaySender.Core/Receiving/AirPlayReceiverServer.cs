@@ -174,6 +174,16 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
             ("POST", "/pair-setup") => BuildPairSetupResponse(request, pairing, hapPairSetup),
             ("POST", "/pair-verify") => BuildPairVerifyResponse(request, pairing),
             ("POST", "/fp-setup") => BuildFpSetupResponse(request, fairplay),
+            // A periodic health / keep-alive POST the sender makes every ~2s.
+            // UxPlay's raop_handler_feedback just answers 200 with an empty body.
+            // Left unhandled it fell through to 501: an iPhone shrugs that off and
+            // keeps streaming, but a real Mac (macOS 26+/AirPlay 980+) throttles
+            // its video encoder to ~0 within a second or two of the first rejected
+            // /feedback — the mid-session "freeze" seen live the first time we
+            // advertised a modern receiver model. Confirmed from a capture: the
+            // Mac keeps the RTSP session open and sends only tiny keep-alive video
+            // packets (~0.1 Mbps) from then on.
+            ("POST", var fbUrl) when fbUrl.Contains("/feedback") => (BuildFeedbackResponse(request), false),
             ("SETUP", _) => BuildSetupResponse(request, pairing, fairplay, mirror, remoteAddr),
             ("GET_PARAMETER", _) => (BuildGetParameterResponse(request, mirror), false),
             ("SET_PARAMETER", _) => (BuildSetParameterResponse(request, mirror), false),
@@ -497,6 +507,24 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
         return (BuildOctetStreamResponse(request, body), false);
     }
 
+    /// <summary>
+    /// The sender's ~2s health / keep-alive POST. We answer 200 with an empty
+    /// body (like UxPlay) — enough to stop a modern Mac freezing, but a real
+    /// Apple TV returns a plist here reporting per-stream health, and without it
+    /// macOS 26+/AirPlay 980+ keeps its mirror encoder pinned near its bitrate
+    /// floor (~2-3 Mbps at 2560x1440, confirmed live even with video playing on
+    /// the mirrored screen and a fat network). Logs the request in full so the
+    /// real expected body/response shape can actually be worked out.
+    /// </summary>
+    private byte[] BuildFeedbackResponse(RtspRequest request)
+    {
+        string headers = string.Join(" | ", request.Headers.Select(h => $"{h.Key}={h.Value}"));
+        Trace(request.Body.Length > 0
+            ? $"  /feedback body({request.Body.Length}B) ct={request.Header("Content-Type")} hex={Convert.ToHexString(request.Body)} headers=[{headers}]"
+            : $"  /feedback senza corpo headers=[{headers}]");
+        return BuildStatusResponse(request, 200, "OK");
+    }
+
     /// <summary>The one query a mirroring client is known to poll here: a "volume\r\n" body under Content-Type text/parameters. Shape from UxPlay's raop_handler_get_parameter — answer with the volume the client itself last set, so its slider stays in sync.</summary>
     private byte[] BuildGetParameterResponse(RtspRequest request, MirrorSetupState mirror)
     {
@@ -567,6 +595,11 @@ public sealed class AirPlayReceiverServer : IAsyncDisposable
     /// </summary>
     private byte[] BuildInfoResponse(RtspRequest request)
     {
+        // The modern Mac flow (combinedGetInfoWithControlSetup) leans on this
+        // response to configure its encoder — log exactly what it asks for so a
+        // fuller reply can be built to lift the mirror bitrate.
+        Trace($"  GET /info: body({request.Body.Length}B){(request.Body.Length > 0 ? " hex=" + Convert.ToHexString(request.Body) : "")} headers=[{string.Join(" | ", request.Headers.Select(h => $"{h.Key}={h.Value}"))}]");
+
         bool wantsAirPlayTxt = true; // default even without a recognizable qualifier body — harmless to include
         bool wantsRaopTxt = false;
         PlistValue? reqPlist = request.Body.Length > 0 ? BinaryPlist.Decode(request.Body) : null;

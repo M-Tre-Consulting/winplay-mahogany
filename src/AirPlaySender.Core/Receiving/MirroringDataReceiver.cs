@@ -238,6 +238,16 @@ public sealed class MirroringDataReceiver : IAsyncDisposable
 
     private int _droppedBeforeFirstKeyFrame;
 
+    // Rolling video-bitrate meter, logged ~every 2s: the actual Mbps/fps a
+    // sender is pushing at us. Added to compare the mirror-encode quality a
+    // Mac/iPhone offers across different advertised receiver models (see
+    // AirPlayMirroringAdvertiser.Model) — a soft-looking picture at a healthy
+    // resolution is a bitrate problem, and this is how to see it. Counts video
+    // payload bytes only, not the 128-byte packet headers.
+    private long _brBytes;
+    private int _brFrames;
+    private long _brWindowStartMs;
+
     private async Task ReadPacketsAsync(TcpClient client, CancellationToken ct)
     {
         NetworkStream stream = client.GetStream();
@@ -306,6 +316,20 @@ public sealed class MirroringDataReceiver : IAsyncDisposable
                 // 2^32-scaled fraction), NOT a raw nanosecond count — convert it the way
                 // UxPlay's raop_rtp_mirror.c does (raop_ntp_timestamp_to_nano_seconds).
                 ulong tsNs = Ntp.ToNanoseconds(BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(8, 8)));
+
+                _brBytes += payloadSize;
+                _brFrames++;
+                long nowMs = Environment.TickCount64;
+                if (_brWindowStartMs == 0) _brWindowStartMs = nowMs;
+                else if (nowMs - _brWindowStartMs >= 2000)
+                {
+                    double secs = (nowMs - _brWindowStartMs) / 1000.0;
+                    Trace($"bitrate video ~{_brBytes * 8.0 / secs / 1_000_000.0:F1} Mbps a {_brFrames / secs:F0} fps");
+                    _brBytes = 0;
+                    _brFrames = 0;
+                    _brWindowStartMs = nowMs;
+                }
+
                 HandleVideoPayload(payload, tsNs);
             }
         }
