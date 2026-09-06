@@ -107,5 +107,15 @@ Write-Host "==> ISCC.exe (Inno Setup)" -ForegroundColor Cyan
 & $InnoCompiler (Join-Path $PSScriptRoot "WinPlayMahogany.iss")
 if ($LASTEXITCODE -ne 0) { throw "ISCC.exe failed with exit code $LASTEXITCODE" }
 
+# Refresh the Debug build output too, so
+# src\AirPlaySender.App\bin\Debug\net9.0-windows10.0.19041.0\win-x64\AirPlaySender.App.exe
+# always mirrors the version just packaged into the installer - that path is
+# the day-to-day "run the current build" shortcut. It's a framework-dependent
+# Debug build (needs the .NET SDK/runtime on this machine), NOT the
+# self-contained binary that ships in the Setup.exe - same code, same version.
+Write-Host "==> dotnet build (Debug, win-x64) - keeps bin\Debug\...\win-x64 current with this release" -ForegroundColor Cyan
+dotnet build $appProject -c Debug -r win-x64
+if ($LASTEXITCODE -ne 0) { throw "dotnet build (Debug) failed with exit code $LASTEXITCODE" }
+
 Write-Host "==> Done. Installer in installer\output\" -ForegroundColor Green
 Get-ChildItem (Join-Path $PSScriptRoot "output") -Filter "*.exe" | Select-Object Name, Length, LastWriteTime
