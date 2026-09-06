@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Runtime.InteropServices;
 using AirPlaySender.Core;
 using AirPlaySender.Core.Discovery;
 using AirPlaySender.Core.Pairing;
@@ -58,11 +59,33 @@ public sealed partial class MainWindow : Window
     /// <summary>Hides the window without closing it — the tray icon (and the mirroring receiver behind it) keeps running.</summary>
     public void HideToTray() => GetAppWindow().Hide();
 
-    private void ShowMainWindow()
+    /// <summary>
+    /// Brings the window back from the tray (or from behind other windows) and to the
+    /// foreground. Used by the tray icon AND by a second launch attempt, which — instead
+    /// of starting its own copy — signals the running instance to call this (see
+    /// <see cref="Program.ListenForActivationRequests"/>).
+    /// </summary>
+    public void ShowFromTray()
     {
-        AppWindow appWindow = GetAppWindow();
-        appWindow.Show();
-        Activate();
+        try
+        {
+            AppWindow appWindow = GetAppWindow();
+            appWindow.Show();
+            if (appWindow.Presenter is OverlappedPresenter { State: OverlappedPresenterState.Minimized } presenter)
+                presenter.Restore();
+
+            // AppWindow.Show()/Activate() alone won't pull the window in front of whatever
+            // app currently holds the foreground — nudge it with the Win32 calls too.
+            nint hwnd = WindowNative.GetWindowHandle(this);
+            NativeMethods.ShowWindow(hwnd, NativeMethods.SW_RESTORE);
+            NativeMethods.SetForegroundWindow(hwnd);
+            Activate();
+        }
+        catch
+        {
+            // Worst case the window shows without stealing focus — still better than nothing.
+            try { GetAppWindow().Show(); Activate(); } catch { }
+        }
     }
 
     private void ExitApplication()
@@ -87,10 +110,10 @@ public sealed partial class MainWindow : Window
     // which is easiest to get right in code rather than via XAML/x:Bind.
     private void SetupTrayIcon()
     {
-        var openItem = new MenuFlyoutItem { Text = "Apri", Command = new RelayCommand(ShowMainWindow) };
+        var openItem = new MenuFlyoutItem { Text = "Apri", Command = new RelayCommand(ShowFromTray) };
         var exitItem = new MenuFlyoutItem { Text = "Esci", Command = new RelayCommand(ExitApplication) };
         TrayIcon.ContextFlyout = new MenuFlyout { Items = { openItem, exitItem } };
-        TrayIcon.LeftClickCommand = new RelayCommand(ShowMainWindow);
+        TrayIcon.LeftClickCommand = new RelayCommand(ShowFromTray);
 
         try
         {
@@ -112,6 +135,17 @@ public sealed partial class MainWindow : Window
         public event EventHandler? CanExecuteChanged { add { } remove { } }
         public bool CanExecute(object? parameter) => true;
         public void Execute(object? parameter) => execute();
+    }
+
+    private static class NativeMethods
+    {
+        public const int SW_RESTORE = 9;
+
+        [DllImport("user32.dll")]
+        public static extern bool ShowWindow(nint hWnd, int nCmdShow);
+
+        [DllImport("user32.dll")]
+        public static extern bool SetForegroundWindow(nint hWnd);
     }
 
     // App is unpackaged (WindowsPackageType=None), so unlike a packaged WinUI 3

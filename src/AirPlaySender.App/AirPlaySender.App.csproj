@@ -10,6 +10,9 @@
     <UseWinUI>true</UseWinUI>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- We provide our own Program.Main (single-instance guard) instead of the
+         one the XAML compiler generates — see Program.cs. -->
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
     <!-- H264Mft.cs's NV12->BGRA inner loop is an unsafe pointer walk. -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 

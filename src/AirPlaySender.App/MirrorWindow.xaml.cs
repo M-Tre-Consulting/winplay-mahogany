@@ -193,16 +193,29 @@ public sealed partial class MirrorWindow : Window
     private void OnConfigReceived(byte[] sps, byte[] pps)
     {
         AppLog.Write($"MirrorWindow.OnConfigReceived: SPS {sps.Length} byte, PPS {pps.Length} byte");
-        if (_configured) return;
-        _configured = true;
+
+        if (_configured)
+        {
+            // A later config packet — the iPhone re-sends SPS/PPS whenever the screen is
+            // rotated or the resolution changes. Nothing to do here: the decode loop
+            // rebuilds its H.264 decoder off the next IDR's in-band SPS, and OnDecodedFrame
+            // re-fits the window + render surface to whatever size actually comes out.
+            if (H264Sps.TryParseDimensions(sps, out int cw, out int ch))
+                AppLog.Write($"  Config aggiornata a sessione avviata: {cw}x{ch} (rotazione / cambio risoluzione) — se ne occupa la pipeline di decodifica");
+            return;
+        }
 
         if (H264Sps.TryParseDimensions(sps, out int width, out int height))
+        {
             AppLog.Write($"  Dimensioni vere lette dalla SPS: {width}x{height}");
+        }
         else
         {
             AppLog.Write("  H264Sps non ha riconosciuto questa SPS — fallback 1920x1080 (il decoder negozierà la dimensione vera)");
             width = 1920; height = 1080;
         }
+
+        _configured = true;
         _videoWidth = width;
         _videoHeight = height;
 
@@ -234,6 +247,17 @@ public sealed partial class MirrorWindow : Window
             nint hwnd = WindowNative.GetWindowHandle(this);
             WindowId windowId = Win32Interop.GetWindowIdFromWindow(hwnd);
             AppWindow appWindow = AppWindow.GetFromWindowId(windowId);
+
+            // Don't fight a window the user has maximized or put full screen (F11): the
+            // Viewbox already rescales the video to whatever space it has, and the
+            // swap-chain / decoder resize is handled separately. Only auto-size a normal
+            // restored window — this matters on a mid-session rotation, where ResizeToVideo
+            // now runs again with the new orientation's dimensions.
+            if (_isFullScreen || appWindow.Presenter is OverlappedPresenter { State: OverlappedPresenterState.Maximized })
+            {
+                AppLog.Write($"  ResizeToVideo({width}x{height}) saltato (finestra massimizzata / schermo intero) — ci pensa il Viewbox");
+                return;
+            }
 
             // AppWindow.Resize sets the OUTER window size (title bar + borders included),
             // not the client area — measure the non-client overhead once, then correct.
@@ -339,6 +363,7 @@ public sealed partial class MirrorWindow : Window
             return;
         }
 
+        int curW = width, curH = height;
         try
         {
             while (!_closed.IsCancellationRequested)
@@ -353,6 +378,34 @@ public sealed partial class MirrorWindow : Window
                     s = _queue.Dequeue();
                 }
 
+                // The iPhone re-encodes at a new resolution whenever the screen is
+                // rotated (portrait <-> landscape) or the resolution otherwise changes,
+                // and marks the switch with a fresh IDR carrying its own SPS in-band.
+                // Feeding those frames to a decoder still set up for the old orientation
+                // is what shredded the picture. Rebuild the MFT from scratch for the new
+                // size — cleaner and more reliable than riding a mid-stream
+                // MF_E_TRANSFORM_STREAM_CHANGE across a 90° flip.
+                if (s.IsKeyFrame
+                    && TryReadKeyFrameDimensions(s.AnnexB, out int kfW, out int kfH)
+                    && (kfW != curW || kfH != curH))
+                {
+                    AppLog.Write($"  Risoluzione stream cambiata {curW}x{curH} -> {kfW}x{kfH}: ricreo il decoder H.264");
+                    try
+                    {
+                        decoder.FrameDecoded -= OnDecodedFrame;
+                        decoder.Dispose();
+                        decoder = new H264Mft(kfW, kfH);
+                        decoder.FrameDecoded += OnDecodedFrame;
+                        _decoder = decoder;
+                        curW = kfW; curH = kfH;
+                        AppLog.Write($"  Decoder H.264 ricreato: coded->display {decoder.DisplayW}x{decoder.DisplayH}");
+                    }
+                    catch (Exception ex)
+                    {
+                        AppLog.Write($"  Ricreazione decoder fallita: {ex}");
+                    }
+                }
+
                 try { decoder.Decode(s.AnnexB, s.Pts.Ticks); }
                 catch (Exception ex) { AppLog.Write($"  decode fallito: {ex.Message}"); }
             }
@@ -361,6 +414,44 @@ public sealed partial class MirrorWindow : Window
         {
             try { decoder.Dispose(); } catch { }
             _decoder = null;
+        }
+    }
+
+    /// <summary>
+    /// Finds the first SPS NAL (type 7) in an Annex-B access unit and reads its picture
+    /// size. A mirroring key frame always carries SPS/PPS in-band (prepended by the
+    /// receiver if the phone didn't), so this is how the decode loop notices a rotation
+    /// without depending on the separate config packet arriving.
+    /// </summary>
+    private static bool TryReadKeyFrameDimensions(byte[] annexB, out int width, out int height)
+    {
+        width = 0;
+        height = 0;
+        int n = annexB.Length;
+        int nalStart = -1;
+        int p = 0;
+        while (p + 2 < n)
+        {
+            if (annexB[p] == 0 && annexB[p + 1] == 0 && annexB[p + 2] == 1)
+            {
+                if (nalStart >= 0 && TrySpsSlice(annexB, nalStart, p, out width, out height)) return true;
+                nalStart = p + 3;
+                p = nalStart;
+            }
+            else
+            {
+                p++;
+            }
+        }
+        return nalStart >= 0 && nalStart < n && TrySpsSlice(annexB, nalStart, n, out width, out height);
+
+        static bool TrySpsSlice(byte[] buf, int start, int endExclusive, out int w, out int h)
+        {
+            w = 0;
+            h = 0;
+            if (start >= endExclusive) return false;
+            if ((buf[start] & 0x1F) != 7) return false; // not an SPS NAL
+            return H264Sps.TryParseDimensions(buf.AsSpan(start, endExclusive - start), out w, out h);
         }
     }
 
@@ -381,8 +472,26 @@ public sealed partial class MirrorWindow : Window
 
                 if ((int)target.SizeInPixels.Width != w || (int)target.SizeInPixels.Height != h)
                 {
-                    // decoder's real size differs from the surface — resize on the UI thread and skip this frame.
-                    DispatcherQueue.TryEnqueue(() => { try { EnsureSwapChain(w, h); } catch (Exception ex) { AppLog.Write($"  resize surface fallito: {ex}"); } });
+                    // The decoder's frame size no longer matches the surface — this is
+                    // also the path a rotation takes. Re-fit the WINDOW to the new aspect
+                    // (not just the swap chain), then resize the surface, on the UI thread;
+                    // skip this one frame.
+                    DispatcherQueue.TryEnqueue(() =>
+                    {
+                        try
+                        {
+                            if (w != _videoWidth || h != _videoHeight)
+                            {
+                                AppLog.Write($"  Output decoder {_videoWidth}x{_videoHeight} -> {w}x{h}: riadatto finestra e superficie");
+                                _videoWidth = w;
+                                _videoHeight = h;
+                                ResizeToVideo(w, h);
+                                (Content as FrameworkElement)?.UpdateLayout();
+                            }
+                            EnsureSwapChain(w, h);
+                        }
+                        catch (Exception ex) { AppLog.Write($"  resize surface fallito: {ex}"); }
+                    });
                     return;
                 }
 

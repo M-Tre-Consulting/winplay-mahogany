@@ -54,6 +54,11 @@ public partial class App : Application
             _window.Activate();
         }
 
+        // Single-instance: a second launch signals us (see Program) instead of
+        // starting its own copy — bring the window back from the tray / foreground it.
+        Program.ListenForActivationRequests(() =>
+            _window?.DispatcherQueue.TryEnqueue(() => (_window as MainWindow)?.ShowFromTray()));
+
         StartMirroringReceiver();
 
         // First CanvasDevice.GetSharedDevice() (Win2D/D3D init) can take a few hundred ms.

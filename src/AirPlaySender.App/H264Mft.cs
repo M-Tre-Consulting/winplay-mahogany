@@ -50,6 +50,14 @@ internal sealed class H264Mft : IDisposable
 
     private readonly IMFTransform _mft;
     private int _codedW, _codedH, _stride;
+    // The un-padded picture size the SPS says this stream has — passed to the ctor and
+    // fixed for the life of this decoder. On an iPhone rotation the caller throws this
+    // whole decoder away and builds a new one for the new size (see MirrorWindow's
+    // decode loop), so it never has to change mid-stream. ReadOutputGeometry uses it as
+    // the crop rectangle when it fits inside the decoder's coded size, else falls back
+    // to the coded size.
+    private readonly int _targetDisplayW;
+    private readonly int _targetDisplayH;
     private bool _mfStarted;
     // Reused across frames — the FrameDecoded handler copies it out synchronously
     // (Win2D SetPixelBytes), so one buffer is enough and it keeps 40 * 3.8MB/s of
@@ -66,6 +74,8 @@ internal sealed class H264Mft : IDisposable
     {
         DisplayW = displayW > 0 ? displayW : 1920;
         DisplayH = displayH > 0 ? displayH : 1080;
+        _targetDisplayW = displayW > 0 ? displayW : 0;
+        _targetDisplayH = displayH > 0 ? displayH : 0;
 
         MediaFactory.MFStartup(false).CheckError();
         _mfStarted = true;
@@ -124,9 +134,23 @@ internal sealed class H264Mft : IDisposable
         _codedH = (int)(fs & 0xFFFFFFFF);
         try { _stride = unchecked((int)t.GetUInt32(MediaTypeAttributeKeys.DefaultStride)); } catch (SharpGenException) { _stride = _codedW; }
         if (_stride <= 0) _stride = _codedW;
-        if (DisplayW <= 0 || DisplayW > _codedW) DisplayW = _codedW;
-        if (DisplayH <= 0 || DisplayH > _codedH) DisplayH = _codedH;
         t.Dispose();
+
+        // Recompute the display (crop) rectangle from scratch on every renegotiation —
+        // never carry a previous DisplayW/DisplayH forward. Prefer the SPS-derived size
+        // when it fits inside the decoder's coded rectangle, else fall back to the coded
+        // size (right aspect ratio, at most a ~15px macroblock-padding strip).
+        int tw = _targetDisplayW, th = _targetDisplayH;
+        if (tw > 0 && th > 0 && tw <= _codedW && th <= _codedH)
+        {
+            DisplayW = tw;
+            DisplayH = th;
+        }
+        else
+        {
+            DisplayW = _codedW;
+            DisplayH = _codedH;
+        }
     }
 
     // Input sample/buffer, allocated once and grown only if a bigger access
