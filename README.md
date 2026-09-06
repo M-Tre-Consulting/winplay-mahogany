@@ -448,6 +448,21 @@ verificati empiricamente in questo progetto:
   delay sceso a zero**. Altri modelli/versioni di iPhone o Mac potrebbero
   negoziare uno schema diverso (soprattutto il pairing HAP moderno, di cui
   c'è solo il pair-verify confermato dal vivo).
+- **Modello annunciato e bitrate.** Il ricevitore si annuncia come
+  `AppleTV6,2` (Apple TV 4K 2017; era `AppleTV3,2` del 2013, overridabile
+  con la env var `WINPLAY_MODEL`). Contro un iPhone il bitrate del
+  mirroring sale da "molle" a 12–14 Mbps stabili a 60fps. Contro un
+  MacBook Air (macOS 27 beta, AirPlay 980) il modello non sposta niente e
+  l'encoder del Mac resta prudente — ~4–10 Mbps a 2560×1440 anche con
+  movimento pieno: è l'ABR di macOS sul Wi-Fi, non un limite del
+  ricevitore. `POST /feedback` ora risponde 200 come UxPlay: cadeva in un
+  501 e un Mac recente spegneva l'encoder ~1 s dopo ("freeze a metà
+  sessione").
+- **Scaling della finestra.** Il frame viene ridimensionato alla dimensione
+  reale a schermo con un ricampionamento cubico di qualità
+  (`CanvasImageInterpolation.HighQualityCubic`) invece di lasciarlo fare al
+  compositore in bilineare — testo e bordi più netti quando la finestra non
+  è a un 1:1 esatto col video (schermo 1080p, finestra non massimizzata).
 - Nessun lip-sync misurato: l'audio parte con ~50 ms di buffer, senza
   allineamento esplicito ai timestamp del video.
 - Una sola sessione di mirroring per volta; riconnessioni non provate.

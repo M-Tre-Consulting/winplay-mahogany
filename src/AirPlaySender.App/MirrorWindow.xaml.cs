@@ -83,11 +83,11 @@ public sealed partial class MirrorWindow : Window
     // from the UI thread while the decode thread is mid-present.
     private readonly object _renderGate = new();
     private CanvasDevice? _canvasDevice;
-    private Viewbox? _swapViewbox;
     private CanvasSwapChainPanel? _swapPanel;
     private CanvasSwapChain? _swapChain;
     private CanvasRenderTarget? _renderTarget; // persistent blit target — SetPixelBytes each frame, no per-frame GPU alloc
-    private int _surfaceWidth, _surfaceHeight;
+    private int _surfaceWidth, _surfaceHeight;  // _renderTarget: native video resolution
+    private int _swapPxW, _swapPxH;             // _swapChain: on-screen panel size in physical pixels (see EnsureSwapChain)
 
     public MirrorWindow()
     {
@@ -102,9 +102,9 @@ public sealed partial class MirrorWindow : Window
     /// covers the whole monitor) — requested so mirroring a wide/oddly-shaped
     /// source (e.g. a Mac's own screen) isn't cropped by window chrome the way
     /// it would be under a maximized-but-still-bordered window. The video
-    /// already scales correctly to whatever space it's given (see the Viewbox
-    /// in <see cref="EnsureSwapChain"/>), so this only needs to change how
-    /// much space that is.
+    /// already scales correctly to whatever space it's given (the per-frame
+    /// draw in <see cref="OnDecodedFrame"/> fits it to the swap chain), so this
+    /// only needs to change how much space that is.
     /// </summary>
     private void RootGrid_KeyDown(object sender, KeyRoutedEventArgs e)
     {
@@ -249,13 +249,13 @@ public sealed partial class MirrorWindow : Window
             AppWindow appWindow = AppWindow.GetFromWindowId(windowId);
 
             // Don't fight a window the user has maximized or put full screen (F11): the
-            // Viewbox already rescales the video to whatever space it has, and the
+            // per-frame draw already fits the video to whatever space it has, and the
             // swap-chain / decoder resize is handled separately. Only auto-size a normal
             // restored window — this matters on a mid-session rotation, where ResizeToVideo
             // now runs again with the new orientation's dimensions.
             if (_isFullScreen || appWindow.Presenter is OverlappedPresenter { State: OverlappedPresenterState.Maximized })
             {
-                AppLog.Write($"  ResizeToVideo({width}x{height}) saltato (finestra massimizzata / schermo intero) — ci pensa il Viewbox");
+                AppLog.Write($"  ResizeToVideo({width}x{height}) saltato (finestra massimizzata / schermo intero) — ci pensa il fit per-frame");
                 return;
             }
 
@@ -272,60 +272,93 @@ public sealed partial class MirrorWindow : Window
         catch (Exception ex) { AppLog.Write($"  ResizeToVideo fallito: {ex}"); }
     }
 
-    private void EnsureSwapChain(int width, int height)
+    /// <summary>
+    /// Sizes both surfaces: <see cref="_renderTarget"/> stays at the native video
+    /// resolution (<paramref name="videoW"/>×<paramref name="videoH"/> — that's what
+    /// <c>SetPixelBytes</c> writes), while <see cref="_swapChain"/> is sized to the
+    /// panel's real on-screen extent in physical pixels and kept in step with it via
+    /// <see cref="SwapPanel_SizeChanged"/>.
+    ///
+    /// The old design pinned the swap chain to the native video size and let a
+    /// <c>Viewbox</c> (i.e. DirectComposition) scale the whole panel to fit the window
+    /// — always bilinear, which softened everything whenever the window wasn't at an
+    /// exact 1:1 with the video (a 1080p screen, a non-maximized window: most people).
+    /// Now the per-frame draw does that scale itself, with
+    /// <see cref="CanvasImageInterpolation.HighQualityCubic"/>, into a swap chain that
+    /// already matches the display 1:1 — so the compositor just blits. Aspect ratio is
+    /// preserved by drawing into a centred sub-rectangle (see <see cref="OnDecodedFrame"/>),
+    /// with the rest cleared black; shrinking the window scales the picture down rather
+    /// than clipping it (the behaviour the Viewbox was added for).
+    /// </summary>
+    private void EnsureSwapChain(int videoW, int videoH)
     {
-        if (width <= 0 || height <= 0) { width = 1920; height = 1080; }
+        if (videoW <= 0 || videoH <= 0) { videoW = 1920; videoH = 1080; }
 
         if (_swapPanel is null)
         {
-            // Fixed size (native video resolution) — a CanvasSwapChainPanel
-            // doesn't scale its swap chain's pixels to fill a differently-sized
-            // panel, it composites them at native size anchored top-left. Sat
-            // directly in RootGrid with Center/Center that gave the right look
-            // ONLY while the window was >= native size (letterbox/pillarbox
-            // around a 1:1 video) — shrinking the window below native size
-            // just clipped the panel against the window edge instead of
-            // scaling it down, cutting off part of the picture (found live,
-            // reported by the user: "riduco le proporzioni e taglia parte
-            // dello schermo"). Fix: wrap the fixed-size panel in a Viewbox
-            // (Stretch="Uniform") instead of parenting it to RootGrid
-            // directly — the Viewbox scales the whole panel as a unit to fit
-            // whatever space is available, in both directions, always
-            // preserving the video's real aspect ratio; the swap chain itself
-            // keeps rendering at true native pixel resolution regardless (no
-            // resize of the actual surface on every window drag), only the
-            // on-screen presentation scales. RootGrid stays Stretch and black,
-            // still giving the letterbox/pillarbox behind it.
-            _swapPanel = new CanvasSwapChainPanel();
-            _swapViewbox = new Viewbox
+            _swapPanel = new CanvasSwapChainPanel
             {
-                Stretch = Stretch.Uniform,
                 HorizontalAlignment = Microsoft.UI.Xaml.HorizontalAlignment.Stretch,
                 VerticalAlignment = Microsoft.UI.Xaml.VerticalAlignment.Stretch,
-                Child = _swapPanel,
             };
-            RootGrid.Children.Add(_swapViewbox);
+            _swapPanel.SizeChanged += SwapPanel_SizeChanged;
+            _swapPanel.CompositionScaleChanged += (s, e) => SwapPanel_SizeChanged(s, null!);
+            RootGrid.Children.Add(_swapPanel);
         }
-
-        if (_swapChain is not null && _surfaceWidth == width && _surfaceHeight == height) return;
-
-        _swapPanel.Width = width;
-        _swapPanel.Height = height;
 
         CanvasDevice device = _canvasDevice ??= CanvasDevice.GetSharedDevice();
         lock (_renderGate)
         {
+            if (_renderTarget is null || _surfaceWidth != videoW || _surfaceHeight != videoH)
+            {
+                CanvasRenderTarget? oldTarget = _renderTarget;
+                _renderTarget = new CanvasRenderTarget(device, videoW, videoH, 96f);
+                _surfaceWidth = videoW;
+                _surfaceHeight = videoH;
+                try { oldTarget?.Dispose(); } catch { }
+            }
+        }
+        EnsureSwapChainForPanel();
+    }
+
+    /// <summary>(Re)creates <see cref="_swapChain"/> to match the panel's current physical-pixel size. Cheap no-op when the size hasn't changed. Called on first layout and on every <see cref="SwapPanel_SizeChanged"/>.</summary>
+    private void EnsureSwapChainForPanel()
+    {
+        if (_swapPanel is null || _ended) return;
+        CanvasDevice device = _canvasDevice ??= CanvasDevice.GetSharedDevice();
+
+        // Physical-pixel size the panel actually occupies = DIP size × composition
+        // scale. CompositionScaleX/Y is the value SwapChainPanel itself uses to map a
+        // back buffer 1:1 onto the screen; fall back to the layout rasterization scale
+        // before the panel has composed once.
+        double scaleX = _swapPanel.CompositionScaleX > 0 ? _swapPanel.CompositionScaleX : (RootGrid.XamlRoot?.RasterizationScale ?? 1.0);
+        double scaleY = _swapPanel.CompositionScaleY > 0 ? _swapPanel.CompositionScaleY : (RootGrid.XamlRoot?.RasterizationScale ?? 1.0);
+        double dipW = _swapPanel.ActualWidth, dipH = _swapPanel.ActualHeight;
+        // Before the first layout pass ActualWidth/Height are 0 — fall back to the
+        // render-target (video) size so there's always a valid swap chain; the
+        // SizeChanged that follows real layout corrects it.
+        if (dipW < 1 || dipH < 1) { dipW = _surfaceWidth > 0 ? _surfaceWidth : 1920; dipH = _surfaceHeight > 0 ? _surfaceHeight : 1080; scaleX = scaleY = 1.0; }
+
+        int pxW = Math.Max(1, (int)Math.Round(dipW * scaleX));
+        int pxH = Math.Max(1, (int)Math.Round(dipH * scaleY));
+
+        lock (_renderGate)
+        {
+            if (_swapChain is not null && _swapPxW == pxW && _swapPxH == pxH) return;
             CanvasSwapChain? oldChain = _swapChain;
-            CanvasRenderTarget? oldTarget = _renderTarget;
-            _swapChain = new CanvasSwapChain(device, width, height, 96f,
+            _swapChain = new CanvasSwapChain(device, pxW, pxH, 96f,
                 DirectXPixelFormat.B8G8R8A8UIntNormalized, 2, CanvasAlphaMode.Ignore);
-            _renderTarget = new CanvasRenderTarget(device, width, height, 96f);
-            _surfaceWidth = width;
-            _surfaceHeight = height;
+            _swapPxW = pxW;
+            _swapPxH = pxH;
             _swapPanel.SwapChain = _swapChain;
             try { oldChain?.Dispose(); } catch { }
-            try { oldTarget?.Dispose(); } catch { }
         }
+    }
+
+    private void SwapPanel_SizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        try { EnsureSwapChainForPanel(); }
+        catch (Exception ex) { AppLog.Write($"  EnsureSwapChainForPanel fallito: {ex}"); }
     }
 
     // ---- decode thread -------------------------------------------------------------
@@ -472,10 +505,11 @@ public sealed partial class MirrorWindow : Window
 
                 if ((int)target.SizeInPixels.Width != w || (int)target.SizeInPixels.Height != h)
                 {
-                    // The decoder's frame size no longer matches the surface — this is
-                    // also the path a rotation takes. Re-fit the WINDOW to the new aspect
-                    // (not just the swap chain), then resize the surface, on the UI thread;
-                    // skip this one frame.
+                    // The decoder's frame size no longer matches the render target — the
+                    // rotation / resolution-change path. Re-fit the WINDOW to the new
+                    // aspect and resize the render target on the UI thread; skip this one
+                    // frame. The swap chain follows the panel, not the video, so it needs
+                    // nothing here beyond what EnsureSwapChain already forwards.
                     DispatcherQueue.TryEnqueue(() =>
                     {
                         try
@@ -495,9 +529,20 @@ public sealed partial class MirrorWindow : Window
                     return;
                 }
 
+                if (_swapPxW < 1 || _swapPxH < 1) return;
+
                 target.SetPixelBytes(bgra);
+
+                // Scale native video -> on-screen size ourselves, with a high-quality
+                // cubic resample, into a swap chain that already matches the display 1:1.
+                // Centred, aspect-preserved; the black clear draws the letterbox/pillarbox.
+                double sw = _swapPxW, sh = _swapPxH, vw = _surfaceWidth, vh = _surfaceHeight;
+                double fit = Math.Min(sw / vw, sh / vh);
+                double dw = vw * fit, dh = vh * fit;
+                var dest = new Windows.Foundation.Rect((sw - dw) / 2.0, (sh - dh) / 2.0, dw, dh);
+                var src = new Windows.Foundation.Rect(0, 0, vw, vh);
                 using (CanvasDrawingSession ds = chain.CreateDrawingSession(Microsoft.UI.Colors.Black))
-                    ds.DrawImage(target);
+                    ds.DrawImage(target, dest, src, 1f, CanvasImageInterpolation.HighQualityCubic);
                 chain.Present(0);
             }
 
